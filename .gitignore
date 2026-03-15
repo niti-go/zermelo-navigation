@@ -1,0 +1,26 @@
+# Datasets and training outputs (large files — don't commit)
+results/
+*.npz
+wandb/
+
+# Build artifacts
+*.egg-info/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# MuJoCo temp files
+*.xml.tmp

@@ -1,0 +1,76 @@
+# =============================================================================
+# Zermelo Navigation — Master Configuration
+# =============================================================================
+# This file is the single source of truth for all environment and dataset
+# generation settings. Both the environment (ZermeloMazeEnv) and the data
+# generation script (generate_zermelo.py) read from this file.
+#
+# Usage:
+#   python data_gen_scripts/generate_zermelo.py --config ../zermelo_config.yaml
+#
+# You can override any value with a second --config or with CLI flags.
+# =============================================================================
+
+# --- Maze / arena layout ---------------------------------------------------
+maze:
+  enabled: true                    # true = internal walls, false = open arena (boundary only)
+  type: medium                    # maze layout name (only "medium" supported currently)
+  map:                            # 2-D grid: 1 = wall, 0 = free.  Ignored when maze.on = false.
+    - [1, 1, 1, 1, 1, 1, 1, 1]
+    - [1, 0, 0, 1, 1, 0, 0, 1]
+    - [1, 0, 0, 1, 0, 0, 0, 1]
+    - [1, 1, 0, 0, 0, 1, 1, 1]
+    - [1, 0, 0, 1, 0, 0, 0, 1]
+    - [1, 0, 1, 0, 0, 1, 0, 1]
+    - [1, 0, 0, 0, 1, 0, 0, 1]
+    - [1, 1, 1, 1, 1, 1, 1, 1]
+  unit: 4.0                       # size of one grid cell in continuous coords
+  height: 0.5                     # wall height (fraction of unit)
+
+# --- Flow field -------------------------------------------------------------
+flow:
+  field_path: null                # path to a .npy flow field file; null = built-in default
+
+# --- Start / goal -----------------------------------------------------------
+start_goal:
+  fixed: true                     # true = same start & goal every episode
+  start_ij: [6, 1]               # grid cell for fixed start  (bottom-left)
+  goal_ij:  [1, 6]               # grid cell for fixed goal   (top-right)
+
+# --- Reward -----------------------------------------------------------------
+reward:
+  goal_reward: 1.0                # sparse reward on reaching the goal
+  energy_weight: 0.0              # penalty per unit of action magnitude per step
+  time_weight: 0.0                # constant per-step penalty
+  drift_threshold: 0.01           # action norm below this counts as "drifting"
+
+# --- Observation ------------------------------------------------------------
+observation:
+  type: states                    # "states" or "pixels"
+  include_flow: true              # append local flow vector to state obs
+
+# --- Environment (misc) -----------------------------------------------------
+env:
+  terminate_at_goal: true         # end the episode when goal is reached
+  goal_tolerance: 1.0             # xy-distance to count as "reached"
+  add_noise_to_goal: true         # jitter goal position slightly each reset
+  success_timing: post            # compute success "pre" or "post" action
+
+# --- Dataset generation -----------------------------------------------------
+dataset:
+  seed: 0
+  num_episodes: 1000
+  max_episode_steps: 1001
+  save_path: datasets/zermelo_pointmaze_medium.npz
+
+# --- Trajectory diversity (data generation only) ----------------------------
+trajectory:
+  max_waypoints: 3                # 0–N random intermediate waypoints per episode
+  waypoint_tolerance: 2.0         # xy-distance to "reach" a waypoint
+  max_detour: 1.5                 # max path-through-waypoint / direct-path ratio
+
+# --- Agent personality ranges (data generation only) ------------------------
+personality:
+  noise:   [0.05, 0.3]           # [min, max] Gaussian action noise
+  inertia: [0.2,  0.7]           # [min, max] heading smoothing
+  speed:   [0.7,  1.0]           # [min, max] action magnitude multiplier

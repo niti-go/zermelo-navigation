@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zermelo-env"
+version = "0.1.0"
+description = "Zermelo navigation: point agent in a maze with fluid flow"
+requires-python = ">=3.9"
+dependencies = [
+    "gymnasium",
+    "mujoco",
+    "numpy",
+    "scipy",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+include = ["zermelo_env*"]
