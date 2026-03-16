@@ -1,11 +1,13 @@
 """Replay 5 random episodes from the most recent .npz dataset and save to video.mp4.
 
 Usage:
-    python data_gen_scripts/visualize_trajectory.py
+    python scripts/visualize.py
 """
 import glob
 import os
 import sys
+
+os.environ['MUJOCO_GL'] = 'egl'
 
 import gymnasium
 import imageio
@@ -13,10 +15,11 @@ import mujoco
 import numpy as np
 
 import zermelo_env  # noqa: register envs
+from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 
 # --- Settings ---
 NUM_EPISODES = 5
-OUT_PATH = 'video.mp4'
+OUT_PATH = 'datasets/video.mp4'
 FPS = 30
 RENDER_SIZE = 400
 ENV_NAME = 'zermelo-pointmaze-medium-v0'
@@ -72,7 +75,9 @@ def main():
     chosen = np.random.choice(len(episodes), size=n, replace=False)
     chosen.sort()
 
-    env = gymnasium.make(ENV_NAME, render_mode='rgb_array', width=RENDER_SIZE, height=RENDER_SIZE)
+    cfg = load_config()
+    env_kwargs = config_to_env_kwargs(cfg)
+    env = gymnasium.make(ENV_NAME, render_mode='rgb_array', width=RENDER_SIZE, height=RENDER_SIZE, **env_kwargs)
     env.reset()
     # Fixed goal position (top-right), matching generate_zermelo.py.
     goal_xy = env.unwrapped.ij_to_xy((1, 6))

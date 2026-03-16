@@ -23,7 +23,7 @@ Trajectory diversity comes from two independent mechanisms:
 All parameters are controlled by a single YAML config file (zermelo_config.yaml).
 
 Usage:
-    python scripts/generate_dataset.py --config configs/zermelo_config.yaml
+    python scripts/generate_dataset.py
 """
 import pathlib
 from collections import defaultdict
@@ -140,9 +140,7 @@ def main(_):
 
     dataset = defaultdict(list)
     total_steps = 0
-    total_train_steps = 0
-    num_train_episodes = ds_cfg['num_episodes']
-    num_val_episodes = ds_cfg['num_episodes'] // 10
+    num_episodes = ds_cfg['num_episodes']
 
     # Per-episode stats for reward parameter tuning.
     ep_lengths = []
@@ -153,7 +151,7 @@ def main(_):
     fixed_init_ij = tuple(sg_cfg['start_ij'])
     fixed_goal_ij = tuple(sg_cfg['goal_ij'])
 
-    for ep_idx in trange(num_train_episodes + num_val_episodes):
+    for ep_idx in trange(num_episodes):
 
         # Choose start and goal for this episode.
         if sg_cfg['fixed']:
@@ -233,8 +231,6 @@ def main(_):
         ep_successes.append(info.get('success', 0.0))
 
         total_steps += step
-        if ep_idx < num_train_episodes:
-            total_train_steps += step
 
     # --- Dataset stats for reward parameter tuning ---
     ep_lengths = np.array(ep_lengths)
@@ -258,12 +254,9 @@ def main(_):
     print(f'  (adjust up/down to make the gap between good and bad episodes larger/smaller)\n')
 
     save_path = ds_cfg['save_path']
-    train_path = save_path
-    val_path = save_path.replace('.npz', '-val.npz')
-    pathlib.Path(train_path).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
-    train_dataset = {}
-    val_dataset = {}
+    save_dataset = {}
     for k, v in dataset.items():
         if 'observations' in k and v[0].dtype == np.uint8:
             dtype = np.uint8
@@ -271,14 +264,10 @@ def main(_):
             dtype = np.float32
         else:
             dtype = np.float32
-        train_dataset[k] = np.array(v[:total_train_steps], dtype=dtype)
-        val_dataset[k] = np.array(v[total_train_steps:], dtype=dtype)
+        save_dataset[k] = np.array(v, dtype=dtype)
 
-    for path, ds in [(train_path, train_dataset), (val_path, val_dataset)]:
-        np.savez_compressed(path, **ds)
-
-    print(f'Saved train dataset to {train_path}')
-    print(f'Saved val dataset to {val_path}')
+    np.savez_compressed(save_path, **save_dataset)
+    print(f'Saved dataset ({total_steps} steps) to {save_path}')
 
 
 if __name__ == '__main__':

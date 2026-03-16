@@ -6,14 +6,20 @@
 # generation script (generate_zermelo.py) read from this file.
 #
 # Usage:
-#   python data_gen_scripts/generate_zermelo.py --config ../zermelo_config.yaml
+#   cd ~/zermelo-navigation
+#   conda activate zermelo
+#   python scripts/generate_dataset.py
+# To visualize data:
+#   python scripts/visualize.py
 #
-# You can override any value with a second --config or with CLI flags.
+# This file is loaded automatically as the default config.
+# To override specific values, pass an additional YAML file:
+#   python scripts/generate_dataset.py --config my_overrides.yaml
 # =============================================================================
 
 # --- Maze / arena layout ---------------------------------------------------
 maze:
-  enabled: true                    # true = internal walls, false = open arena (boundary only)
+  enabled: false                    # true = internal walls, false = open arena (boundary only)
   type: medium                    # maze layout name (only "medium" supported currently)
   map:                            # 2-D grid: 1 = wall, 0 = free.  Ignored when maze.on = false.
     - [1, 1, 1, 1, 1, 1, 1, 1]
@@ -30,6 +36,7 @@ maze:
 # --- Flow field -------------------------------------------------------------
 flow:
   field_path: null                # path to a .npy flow field file; null = built-in default
+  #create a custom flow field using zermelo_flow.py
 
 # --- Start / goal -----------------------------------------------------------
 start_goal:
@@ -59,9 +66,9 @@ env:
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 1000
+  num_episodes: 50
   max_episode_steps: 1001
-  save_path: datasets/zermelo_pointmaze_medium.npz
+  save_path: datasets/zermelo_pointmaze_medium.npz #run this from the repo root
 
 # --- Trajectory diversity (data generation only) ----------------------------
 trajectory:

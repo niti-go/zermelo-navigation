@@ -3,6 +3,10 @@ import os
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
+"""
+To generate a flow field:
+python zermelo_env/zermelo_flow.py --name yellow_path
+"""
 
 class FlowField:
     """Static 2D fluid flow velocity field with bilinear interpolation."""
