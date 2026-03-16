@@ -11,11 +11,13 @@ from the existing drones.
 
 Trajectory diversity comes from two independent mechanisms:
 
-1. Route diversity (which corridors the agent takes):
+1. Route diversity (which path the agent takes):
    - Each episode samples 0-3 random intermediate waypoints between start and goal.
-   - Waypoints are filtered by a detour budget so alternate corridors are explored
+   - Waypoints are filtered by a detour budget so alternate routes are explored
      without absurd backtracking.
-   - The agent BFS-navigates to each waypoint in sequence, then to the goal.
+   - With maze enabled: BFS grid-cell waypoints, agent follows BFS oracle.
+   - With maze disabled (open arena): random XY waypoints in continuous space,
+     agent steers directly toward each waypoint.
 
 2. Agent diversity (how the agent executes the route):
    Each episode rolls a fresh "personality" with three knobs: noise, inertia, speed.
@@ -90,13 +92,52 @@ def sample_reachable_waypoints(maze_map, all_cells, start_ij, goal_ij,
     return waypoints
 
 
+def sample_xy_waypoints(start_xy, goal_xy, xy_bounds, max_waypoints, max_detour):
+    """Sample random XY waypoints in continuous open space (no maze walls).
+
+    Returns a list of (x, y) tuples. The detour budget limits total path length
+    relative to the straight-line start→goal distance.
+    """
+    n_waypoints = np.random.randint(0, max_waypoints + 1)
+    if n_waypoints == 0:
+        return []
+
+    x_min, x_max, y_min, y_max = xy_bounds
+    direct_dist = np.linalg.norm(np.array(goal_xy) - np.array(start_xy))
+    if direct_dist < 1e-6:
+        return []
+
+    budget = max_detour * direct_dist
+
+    waypoints = []
+    current = np.array(start_xy)
+    for _ in range(n_waypoints):
+        # Sample a random point in the arena.
+        wp = np.array([np.random.uniform(x_min, x_max),
+                       np.random.uniform(y_min, y_max)])
+
+        # Check detour budget: path so far + this waypoint + remaining to goal.
+        path_so_far = sum(
+            np.linalg.norm(np.array(waypoints[i]) - (np.array(waypoints[i-1]) if i > 0 else current))
+            for i in range(len(waypoints))
+        )
+        added = np.linalg.norm(wp - (np.array(waypoints[-1]) if waypoints else current))
+        remaining = np.linalg.norm(np.array(goal_xy) - wp)
+
+        if path_so_far + added + remaining <= budget:
+            waypoints.append(tuple(wp))
+
+    return waypoints
+
+
 class AgentPersonality:
     """Per-episode randomized agent with three knobs: noise, inertia, speed."""
 
     def __init__(self, noise_range, inertia_range, speed_range):
         self.noise = np.random.uniform(*noise_range)
         self.inertia = np.random.uniform(*inertia_range)
-        self.speed = np.random.uniform(*speed_range)
+        self._speed_range = speed_range
+        self._speed = np.random.uniform(*speed_range)
         self._smoothed_dir = None
 
     def get_action(self, subgoal_dir):
@@ -109,7 +150,12 @@ class AgentPersonality:
         if norm > 1e-6:
             self._smoothed_dir = self._smoothed_dir / norm
 
-        action = self.speed * self._smoothed_dir + np.random.normal(0, self.noise, 2)
+        # Random-walk the speed (mean-reverting toward center of range).
+        mid = 0.5 * (self._speed_range[0] + self._speed_range[1])
+        self._speed += 0.05 * (mid - self._speed) + np.random.normal(0, 0.03)
+        self._speed = np.clip(self._speed, self._speed_range[0], self._speed_range[1])
+
+        action = self._speed * self._smoothed_dir + np.random.normal(0, self.noise, 2)
         return np.clip(action, -1, 1)
 
 
@@ -138,6 +184,18 @@ def main(_):
             if maze_map[i, j] == 0:
                 all_cells.append((i, j))
 
+    maze_enabled = cfg['maze']['enabled']
+
+    # Compute continuous XY bounds for open-arena waypoint sampling.
+    if not maze_enabled:
+        # Inner free cells are rows/cols 1..6 in an 8x8 grid.
+        corner_min = np.array(env.unwrapped.ij_to_xy((1, 1)))
+        corner_max = np.array(env.unwrapped.ij_to_xy((6, 6)))
+        xy_bounds = (min(corner_min[0], corner_max[0]),
+                     max(corner_min[0], corner_max[0]),
+                     min(corner_min[1], corner_max[1]),
+                     max(corner_min[1], corner_max[1]))
+
     dataset = defaultdict(list)
     total_steps = 0
     num_episodes = ds_cfg['num_episodes']
@@ -165,14 +223,25 @@ def main(_):
                 goal_ij = all_cells[np.random.randint(len(all_cells))]
 
         # Sample intermediate waypoints to force diverse routes.
-        waypoints = sample_reachable_waypoints(
-            maze_map, all_cells, init_ij, goal_ij,
-            traj_cfg['max_waypoints'], traj_cfg['max_detour'],
-        )
-        # Full route: start -> waypoints -> goal.
-        route = waypoints + [goal_ij]
+        if maze_enabled:
+            waypoints_ij = sample_reachable_waypoints(
+                maze_map, all_cells, init_ij, goal_ij,
+                traj_cfg['max_waypoints'], traj_cfg['max_detour'],
+            )
+            # Full route as grid cells: start -> waypoints -> goal.
+            route_ij = waypoints_ij + [goal_ij]
+            route_xy = [np.array(env.unwrapped.ij_to_xy(ij)) for ij in route_ij]
+        else:
+            start_xy = np.array(env.unwrapped.ij_to_xy(init_ij))
+            goal_xy = np.array(env.unwrapped.ij_to_xy(goal_ij))
+            waypoints_xy = sample_xy_waypoints(
+                start_xy, goal_xy, xy_bounds,
+                traj_cfg['max_waypoints'], traj_cfg['max_detour'],
+            )
+            route_xy = [np.array(wp) for wp in waypoints_xy] + [goal_xy]
+
         route_idx = 0
-        current_target_ij = route[route_idx]
+        current_target_xy = route_xy[route_idx]
 
         # Each episode gets a fresh agent personality.
         personality = AgentPersonality(
@@ -189,20 +258,30 @@ def main(_):
         step = 0
         ep_anorms = []
         wp_tol = traj_cfg['waypoint_tolerance']
+        wp_timeout = traj_cfg.get('waypoint_timeout', 200)
+        wp_steps = 0  # steps spent pursuing the current waypoint
 
         while not done:
             agent_xy = env.unwrapped.get_xy()
 
-            # Check if we've reached the current waypoint.
-            current_target_xy = np.array(env.unwrapped.ij_to_xy(current_target_ij))
+            # Check if we've reached the current waypoint, or timed out on it.
             dist_to_waypoint = np.linalg.norm(agent_xy - current_target_xy)
+            wp_steps += 1
 
-            if dist_to_waypoint < wp_tol and route_idx < len(route) - 1:
+            timed_out = wp_steps >= wp_timeout and route_idx < len(route_xy) - 1
+            reached = dist_to_waypoint < wp_tol and route_idx < len(route_xy) - 1
+
+            if reached or timed_out:
                 route_idx += 1
-                current_target_ij = route[route_idx]
+                current_target_xy = route_xy[route_idx]
+                wp_steps = 0
 
-            # Use the BFS oracle to get the direction toward the current target.
-            subgoal_xy, _ = env.unwrapped.get_oracle_subgoal(agent_xy, current_target_xy)
+            # Get direction toward the current target.
+            if maze_enabled:
+                subgoal_xy, _ = env.unwrapped.get_oracle_subgoal(agent_xy, current_target_xy)
+            else:
+                # Open arena: steer directly toward the target.
+                subgoal_xy = current_target_xy
             subgoal_dir = subgoal_xy - agent_xy
             norm = np.linalg.norm(subgoal_dir)
             if norm > 1e-6:
@@ -222,6 +301,7 @@ def main(_):
             dataset['terminals'].append(done)
             dataset['qpos'].append(info['prev_qpos'])
             dataset['qvel'].append(info['prev_qvel'])
+            dataset['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
 
             ob = next_ob
             step += 1

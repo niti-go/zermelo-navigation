@@ -66,6 +66,7 @@ def main():
     data = np.load(dataset_path)
     terminals = data['terminals']
     qpos = data['qpos']
+    goal_xy_all = data.get('goal_xy', None)
 
     episodes = find_episode_boundaries(terminals)
     print(f'{len(episodes)} episodes, {len(terminals)} total steps.')
@@ -79,14 +80,20 @@ def main():
     env_kwargs = config_to_env_kwargs(cfg)
     env = gymnasium.make(ENV_NAME, render_mode='rgb_array', width=RENDER_SIZE, height=RENDER_SIZE, **env_kwargs)
     env.reset()
-    # Fixed goal position (top-right), matching generate_zermelo.py.
-    goal_xy = env.unwrapped.ij_to_xy((1, 6))
-    env.unwrapped.model.geom('target').pos[:2] = goal_xy
 
     all_frames = []
     for idx in chosen:
         start, end = episodes[idx]
         print(f'  Episode {idx}: {end - start} steps')
+
+        # Set goal marker to the actual goal for this episode.
+        if goal_xy_all is not None:
+            env.unwrapped.model.geom('target').pos[:2] = goal_xy_all[start]
+        else:
+            # Fallback for old datasets without goal_xy.
+            goal_xy = env.unwrapped.ij_to_xy(tuple(cfg['start_goal']['goal_ij']))
+            env.unwrapped.model.geom('target').pos[:2] = goal_xy
+
         frames = replay_episode(env, qpos[start:end])
         all_frames.extend(frames)
         # Brief black gap between episodes.

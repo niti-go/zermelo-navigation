@@ -40,9 +40,9 @@ flow:
 
 # --- Start / goal -----------------------------------------------------------
 start_goal:
-  fixed: true                     # true = same start & goal every episode
-  start_ij: [6, 1]               # grid cell for fixed start  (bottom-left)
-  goal_ij:  [1, 6]               # grid cell for fixed goal   (top-right)
+  fixed: false                     # true = same start & goal every episode
+  start_ij: [6, 1]               # grid cell for fixed start  ([6,1]=bottom-left)
+  goal_ij:  [1, 6]               # grid cell for fixed goal   ([1,6]=top-right)
 
 # --- Reward -----------------------------------------------------------------
 reward:
@@ -66,7 +66,7 @@ env:
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 50
+  num_episodes: 5
   max_episode_steps: 1001
   save_path: datasets/zermelo_pointmaze_medium.npz #run this from the repo root
 
@@ -74,10 +74,11 @@ dataset:
 trajectory:
   max_waypoints: 3                # 0–N random intermediate waypoints per episode
   waypoint_tolerance: 2.0         # xy-distance to "reach" a waypoint
-  max_detour: 1.5                 # max path-through-waypoint / direct-path ratio
+  waypoint_timeout: 200           # max steps pursuing one waypoint before skipping to next
+  max_detour: 3.5                 # max path-through-waypoint / direct-path ratio
 
 # --- Agent personality ranges (data generation only) ------------------------
 personality:
   noise:   [0.05, 0.3]           # [min, max] Gaussian action noise
   inertia: [0.2,  0.7]           # [min, max] heading smoothing
-  speed:   [0.7,  1.0]           # [min, max] action magnitude multiplier
+  speed:   [0.2,  1.0]           # [min, max] action magnitude multiplier

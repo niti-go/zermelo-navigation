@@ -299,8 +299,8 @@ def generate_yellow_path_field(save_path=None):
 
     # Middle corridor (6 < x < 14, 6 < y < 13): leftward + upward to block green path
     middle_mask = (xx > 6) & (xx < 14) & (yy > 6) & (yy < 14)
-    vx[middle_mask] = -2.0  # leftward blocks direct path
-    vy[middle_mask] = -2.0  # upward pushes toward yellow route
+    vx[middle_mask] = -1.0  # leftward blocks direct path
+    vy[middle_mask] = -1.0  # upward pushes toward yellow route
 
     return _save_field(save_path, x_range, y_range, vx, vy, 'yellow path field')
 
