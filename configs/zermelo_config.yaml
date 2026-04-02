@@ -46,10 +46,14 @@ start_goal:
 
 # --- Reward -----------------------------------------------------------------
 reward:
-  goal_reward: 1.0                # sparse reward on reaching the goal
+  goal_reward: 100.0                # sparse reward on reaching the goal
   energy_weight: 0.0              # penalty per unit of action magnitude per step
   time_weight: 0.0                # constant per-step penalty
-  drift_threshold: 0.01           # action norm below this counts as "drifting"
+  distance_weight: 0.0            # per-step penalty proportional to distance from goal
+  # The drift threshold is just an informational logging feature, it doesn't affect the reward or dynamics at all.
+  # It helps visualize what fraction of a trajectory involves active control vs passive drift
+  drift_threshold: 0.01           # action norm below this counts as "drifting".
+  
 
 # --- Observation ------------------------------------------------------------
 observation:
@@ -66,7 +70,7 @@ env:
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 5
+  num_episodes: 200
   max_episode_steps: 1001
   save_path: datasets/zermelo_pointmaze_medium.npz #run this from the repo root
 
@@ -75,10 +79,10 @@ trajectory:
   max_waypoints: 3                # 0–N random intermediate waypoints per episode
   waypoint_tolerance: 2.0         # xy-distance to "reach" a waypoint
   waypoint_timeout: 200           # max steps pursuing one waypoint before skipping to next
-  max_detour: 3.5                 # max path-through-waypoint / direct-path ratio
+  max_detour: 2                 # max path-through-waypoint / direct-path ratio
 
 # --- Agent personality ranges (data generation only) ------------------------
 personality:
   noise:   [0.05, 0.3]           # [min, max] Gaussian action noise
   inertia: [0.2,  0.7]           # [min, max] heading smoothing
-  speed:   [0.2,  1.0]           # [min, max] action magnitude multiplier
+  speed:   [0.5,  1.0]           # [min, max] action magnitude multiplier

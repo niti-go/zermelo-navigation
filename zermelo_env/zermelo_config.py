@@ -65,6 +65,7 @@ def config_to_env_kwargs(cfg):
         goal_reward=cfg['reward']['goal_reward'],
         energy_weight=cfg['reward']['energy_weight'],
         time_weight=cfg['reward']['time_weight'],
+        distance_weight=cfg['reward']['distance_weight'],
         drift_threshold=cfg['reward']['drift_threshold'],
         ob_type=cfg['observation']['type'],
         include_flow_in_obs=cfg['observation']['include_flow'],

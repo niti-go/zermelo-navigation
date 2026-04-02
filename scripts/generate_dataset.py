@@ -15,7 +15,8 @@ Trajectory diversity comes from two independent mechanisms:
    - Each episode samples 0-3 random intermediate waypoints between start and goal.
    - Waypoints are filtered by a detour budget so alternate routes are explored
      without absurd backtracking.
-   - With maze enabled: BFS grid-cell waypoints, agent follows BFS oracle.
+   - With maze enabled: BFS grid-cell waypoints, agent follows BFS oracle to reach the
+   next intermediate waypoint.
    - With maze disabled (open arena): random XY waypoints in continuous space,
      agent steers directly toward each waypoint.
 
@@ -167,6 +168,7 @@ def main(_):
     traj_cfg = cfg['trajectory']
     pers_cfg = cfg['personality']
     sg_cfg = cfg['start_goal']
+    reward_cfg = cfg['reward']
 
     np.random.seed(ds_cfg['seed'])
 
@@ -197,6 +199,12 @@ def main(_):
                      max(corner_min[1], corner_max[1]))
 
     dataset = defaultdict(list)
+    # Per-episode reward breakdown accumulators (for stats only, not saved to npz)
+    ep_goal_rewards = []
+    ep_energy_costs = []
+    ep_time_costs = []
+    ep_dist_costs = []
+    ep_dist_sums = []
     total_steps = 0
     num_episodes = ds_cfg['num_episodes']
 
@@ -257,6 +265,11 @@ def main(_):
         done = False
         step = 0
         ep_anorms = []
+        ep_dists = []
+        ep_goal_r = 0.0
+        ep_energy_r = 0.0
+        ep_time_r = 0.0
+        ep_dist_r = 0.0
         wp_tol = traj_cfg['waypoint_tolerance']
         wp_timeout = traj_cfg.get('waypoint_timeout', 200)
         wp_steps = 0  # steps spent pursuing the current waypoint
@@ -295,6 +308,18 @@ def main(_):
 
             ep_anorms.append(np.linalg.norm(action))
 
+            # Reward components (already computed in info by the env).
+            step_goal_r = info.get('success', 0.0) * reward_cfg['goal_reward']
+            step_energy_r = info.get('energy_cost', 0.0)  # already negative
+            step_time_r = -reward_cfg['time_weight']
+            step_dist = info.get('dist_to_goal', 0.0)
+            step_dist_r = -reward_cfg['distance_weight'] * step_dist
+            ep_goal_r += step_goal_r
+            ep_energy_r += step_energy_r
+            ep_time_r += step_time_r
+            ep_dist_r += step_dist_r
+            ep_dists.append(step_dist)
+
             dataset['observations'].append(ob)
             dataset['actions'].append(action)
             dataset['rewards'].append(reward)
@@ -302,6 +327,11 @@ def main(_):
             dataset['qpos'].append(info['prev_qpos'])
             dataset['qvel'].append(info['prev_qvel'])
             dataset['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
+            dataset['dist_to_goal'].append(step_dist)
+            dataset['goal_reward_components'].append(step_goal_r)
+            dataset['energy_reward_components'].append(step_energy_r)
+            dataset['time_reward_components'].append(step_time_r)
+            dataset['distance_reward_components'].append(step_dist_r)
 
             ob = next_ob
             step += 1
@@ -309,6 +339,11 @@ def main(_):
         ep_lengths.append(step)
         ep_action_norms.append(np.mean(ep_anorms))
         ep_successes.append(info.get('success', 0.0))
+        ep_goal_rewards.append(ep_goal_r)
+        ep_energy_costs.append(ep_energy_r)
+        ep_time_costs.append(ep_time_r)
+        ep_dist_costs.append(ep_dist_r)
+        ep_dist_sums.append(np.sum(ep_dists))
 
         total_steps += step
 
@@ -316,6 +351,12 @@ def main(_):
     ep_lengths = np.array(ep_lengths)
     ep_action_norms = np.array(ep_action_norms)
     ep_successes = np.array(ep_successes)
+    ep_goal_rewards = np.array(ep_goal_rewards)
+    ep_energy_costs = np.array(ep_energy_costs)
+    ep_time_costs = np.array(ep_time_costs)
+    ep_dist_costs = np.array(ep_dist_costs)
+    ep_dist_sums = np.array(ep_dist_sums)
+    ep_total_rewards = ep_goal_rewards + ep_energy_costs + ep_time_costs + ep_dist_costs
 
     print(f'\n=== Dataset stats (use these to set reward params) ===')
     print(f'Total steps: {total_steps}')
@@ -324,14 +365,34 @@ def main(_):
           f'min: {ep_lengths.min()}  max: {ep_lengths.max()}')
     print(f'Action norm/step — mean: {ep_action_norms.mean():.3f}  '
           f'min: {ep_action_norms.min():.3f}  max: {ep_action_norms.max():.3f}')
+    print(f'Dist-to-goal sum — mean: {ep_dist_sums.mean():.1f}  '
+          f'min: {ep_dist_sums.min():.1f}  max: {ep_dist_sums.max():.1f}')
+
+    print(f'\n--- Reward breakdown (current weights: goal={reward_cfg["goal_reward"]}, '
+          f'energy={reward_cfg["energy_weight"]}, time={reward_cfg["time_weight"]}, '
+          f'distance={reward_cfg["distance_weight"]}) ---')
+    print(f'  Total reward  — mean: {ep_total_rewards.mean():.3f}  '
+          f'min: {ep_total_rewards.min():.3f}  max: {ep_total_rewards.max():.3f}')
+    print(f'  Goal portion  — mean: {ep_goal_rewards.mean():.3f}  '
+          f'(% of |total|: {100*abs(ep_goal_rewards.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+    print(f'  Energy cost   — mean: {ep_energy_costs.mean():.3f}  '
+          f'(% of |total|: {100*abs(ep_energy_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+    print(f'  Time cost     — mean: {ep_time_costs.mean():.3f}  '
+          f'(% of |total|: {100*abs(ep_time_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+    print(f'  Distance cost — mean: {ep_dist_costs.mean():.3f}  '
+          f'(% of |total|: {100*abs(ep_dist_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
 
     avg_len = ep_lengths.mean()
     avg_anorm = ep_action_norms.mean()
+    avg_dist_sum = ep_dist_sums.mean()
     print(f'\n--- Suggested reward params (targeting ~50% of goal_reward as total penalty) ---')
-    print(f'  time_weight   ≈ {0.5 / avg_len:.5f}   (so {avg_len:.0f} steps × time_weight ≈ 0.5)')
-    print(f'  energy_weight ≈ {0.5 / (avg_len * avg_anorm):.5f}   '
+    print(f'  time_weight     ≈ {0.5 / avg_len:.5f}   (so {avg_len:.0f} steps × time_weight ≈ 0.5)')
+    print(f'  energy_weight   ≈ {0.5 / (avg_len * avg_anorm):.5f}   '
           f'(so {avg_len:.0f} steps × {avg_anorm:.2f} avg_norm × energy_weight ≈ 0.5)')
-    print(f'  (adjust up/down to make the gap between good and bad episodes larger/smaller)\n')
+    print(f'  distance_weight ≈ {0.5 / max(avg_dist_sum, 1e-9):.5f}   '
+          f'(so Σdist={avg_dist_sum:.0f} × distance_weight ≈ 0.5)')
+    print(f'  (adjust up/down to make the gap between good and bad episodes larger/smaller)')
+    print(f'  Run: python scripts/analyze_rewards.py  to visualize and sweep weights\n')
 
     save_path = ds_cfg['save_path']
     pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)

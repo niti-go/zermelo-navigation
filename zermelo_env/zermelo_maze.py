@@ -49,6 +49,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             goal_reward=1.0,
             energy_weight=0.0,
             time_weight=0.0,
+            distance_weight=0.0,
             drift_threshold=0.01,
             goal_tolerance=1.0,
             *args,
@@ -72,6 +73,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._goal_reward = goal_reward
             self._energy_weight = energy_weight
             self._time_weight = time_weight
+            self._distance_weight = distance_weight
             self._drift_threshold = drift_threshold
 
             assert ob_type in ['states', 'pixels']
@@ -396,6 +398,10 @@ def make_zermelo_maze_env(*args, **kwargs):
             # Time cost: constant per-step penalty (every step costs time).
             reward -= self._time_weight
 
+            # Distance cost: per-step penalty proportional to distance from goal.
+            dist_to_goal = np.linalg.norm(self.get_xy() - self.cur_goal_xy)
+            reward -= self._distance_weight * dist_to_goal
+
             # Shift for singletask (reward_task_id) environments.
             if self._reward_task_id is not None:
                 reward = reward - 1.0
@@ -403,7 +409,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             # Add components to info for debugging/logging.
             info['energy_cost'] = energy_cost
             info['is_drifting'] = float(is_drifting)
-            info['dist_to_goal'] = np.linalg.norm(self.get_xy() - self.cur_goal_xy)
+            info['dist_to_goal'] = dist_to_goal
 
             return ob, reward, terminated, truncated, info
 

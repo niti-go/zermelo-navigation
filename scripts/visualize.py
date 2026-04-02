@@ -1,6 +1,7 @@
 """Replay 5 random episodes from the most recent .npz dataset and save to video.mp4.
 
 Usage:
+    cd ~/zermelo-navigation
     python scripts/visualize.py
 """
 import glob
