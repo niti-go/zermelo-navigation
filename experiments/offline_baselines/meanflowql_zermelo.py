@@ -107,7 +107,7 @@ flags.DEFINE_boolean('use_observation_normalization', True, 'Whether to normaliz
 # Zermelo-specific flags
 flags.DEFINE_string('zermelo_dataset', None, 'Path to Zermelo .npz dataset.')
 flags.DEFINE_string('zermelo_config', None, 'Path to zermelo_config.yaml (uses defaults if None).')
-flags.DEFINE_float('reward_shift', -1.0, 'Constant added to all rewards (e.g. -1.0 for antmaze-style).')
+flags.DEFINE_float('reward_shift', 0.0, 'Constant added to all rewards. 0.0 for Zermelo (already has dense penalties).')
 
 # Training configuration flags
 flags.DEFINE_integer('offline_steps', 1000000, 'Number of offline steps.')
