@@ -1,17 +1,91 @@
-"""Reward analysis and hyperparameter tuning for the Zermelo dataset.
+"""Reward weight selection for the Zermelo offline RL dataset.
 
-Loads a generated .npz dataset, reconstructs per-episode reward breakdowns,
-and produces:
-  1. Per-episode stacked bar chart: goal vs energy vs time vs distance components.
-  2. Distribution plots: total reward, episode length, energy/time/distance fractions.
-  3. Weight sweep: sweeps energy_weight, time_weight, and distance_weight over a
-     grid and shows how the reward gap between best and worst episodes changes —
-     useful for picking weights before re-running the environment.
+BACKGROUND
+----------
+The Zermelo environment rewards each trajectory with four components:
 
-Key insight: trajectories are fixed after generation. Changing reward weights
-only changes *how you score* the same trajectories, not what they look like.
-So you can sweep weights analytically using just the stored actions, episode
-lengths, and distances, without re-running the environment.
+    reward_per_step = goal_reward * (reached goal this step)
+                    - energy_weight * ||action||
+                    - time_weight * 1
+                    - distance_weight * dist_to_goal
+
+The goal_reward is a large sparse bonus on the step the agent reaches the
+goal. The three penalty weights control how harshly the reward function
+penalizes energy use, elapsed time, and distance from the goal at every step.
+
+We need to choose the three penalty weights so that:
+  (a) Goal-reaching dominates: successful episodes have positive total reward.
+  (b) Penalties meaningfully differentiate efficient vs. inefficient paths.
+  (c) The per-step reward provides a useful dense learning signal for the
+      offline RL algorithm (not just a sparse goal bonus).
+
+KEY INSIGHT
+-----------
+Trajectories are fixed after dataset generation. Changing reward weights only
+changes how you *score* existing trajectories, not what they look like. So we
+can sweep weights analytically from stored actions, episode lengths, and
+distances — no need to re-run the environment.
+
+WHY TWO STAGES
+--------------
+Energy, time, and distance penalties are highly correlated: longer episodes
+accumulate more energy, more steps, and more cumulative distance. Jointly
+sweeping all three on a grid doesn't work well because:
+
+  1. The penalties move together, so a "balance" constraint (each component
+     contributing a meaningful fraction) is hard to satisfy with 3 correlated
+     axes — one always dominates.
+  2. The distance penalty serves a fundamentally different purpose than
+     energy/time. Energy and time differentiate *trajectory quality* at the
+     episode level (was this path efficient?). Distance provides a *dense
+     per-step learning signal* (am I getting closer to the goal right now?).
+     An objective that maximizes episode-level reward spread doesn't capture
+     the value of per-step signal quality.
+  3. Distance sums can be orders of magnitude larger than energy sums or step
+     counts, so interesting distance_weight values fall between grid points.
+
+Because of this, energy/time and distance are tuned separately.
+
+STAGE 1 — energy_weight and time_weight
+----------------------------------------
+These two weights control trajectory quality differentiation. We sweep a 2D
+grid of (energy_weight, time_weight) combinations and pick the one that
+maximizes reward variance among successful episodes, subject to:
+
+  - All successful episodes retain enough headroom (positive reward minus a
+    budget reserved for the distance penalty that will be added in Stage 2).
+  - The median penalty fraction is moderate (not negligible, not dominant).
+
+To make the grid meaningful, raw signals are normalized to unit variance
+before sweeping. This ensures the grid covers comparable effect ranges for
+both axes regardless of their raw magnitude differences. The grid is
+log-spaced for better coverage across dynamic ranges, and a refinement pass
+runs a fine grid around the best coarse result.
+
+STAGE 2 — distance_weight
+--------------------------
+Rather than optimizing distance_weight for episode-level spread (where it
+adds little beyond energy/time), we set it to produce a useful per-step
+signal for the RL algorithm. Specifically:
+
+  distance_weight is scaled so that the median per-step distance penalty is
+  comparable in magnitude (1:1 ratio) to the median per-step energy + time
+  penalty.
+
+This means at every step, the agent "feels" the distance gradient at roughly
+the same scale as the action cost — enough to provide learning signal without
+overwhelming it. The weight is then capped so that the total distance penalty
+stays within the reserved budget, and at least 90% of successful episodes
+keep positive total reward. The remaining ~10% that go negative are the
+longest, most inefficient trajectories — exactly the ones the RL algorithm
+should learn to avoid.
+
+OUTPUTS
+-------
+  - Recommended energy_weight, time_weight, distance_weight values.
+  - Per-episode stacked bar chart: goal vs. energy vs. time vs. distance.
+  - Distribution plots: total reward, episode length, component breakdowns.
+  - Penalty scatter plots: correlations between penalty components.
 
 Plots are saved to datasets/hyperparameter_tuning/.
 
@@ -205,18 +279,68 @@ def plot_distributions(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_tota
 # Plot 3: Weight sweep heatmaps
 # ---------------------------------------------------------------------------
 
+def _compute_distance_weight(data, episodes, succ_mask, action_norms_per_ep,
+                              lengths, energy_weight, time_weight,
+                              target_ratio=1.0):
+    """Set distance_weight so per-step distance penalty ≈ target_ratio × per-step energy+time penalty.
+
+    This gives the RL agent a dense gradient signal at every step that is
+    comparable in magnitude to the other per-step penalties, without needing
+    to jointly optimize it in the sweep.
+
+    Args:
+        target_ratio: desired ratio of median per-step distance penalty to
+            median per-step (energy + time) penalty. 1.0 means equal magnitude.
+
+    Returns:
+        distance_weight (float)
+    """
+    dist_to_goal = _get_dist_to_goal(data)
+    actions = data['actions']
+
+    per_step_energy = []  # per-step energy penalty magnitude
+    per_step_time = []    # per-step time penalty (just the weight)
+    per_step_dist = []    # per-step raw distance (before weighting)
+
+    for i, (start, end) in enumerate(episodes):
+        if not succ_mask[i]:
+            continue
+        length = end - start
+        norms = np.linalg.norm(actions[start:end], axis=1)
+        per_step_energy.append(energy_weight * norms.mean())
+        per_step_time.append(time_weight)
+        per_step_dist.append(dist_to_goal[start:end].mean())
+
+    if not per_step_dist:
+        return 0.0
+
+    median_other = np.median(per_step_energy) + np.median(per_step_time)
+    median_raw_dist = np.median(per_step_dist)
+
+    if median_raw_dist < 1e-12:
+        return 0.0
+
+    dw = target_ratio * median_other / median_raw_dist
+    return float(dw)
+
+
 def sweep_weights(data, episodes, goal_reward):
-    """Sweep energy_weight, time_weight, and distance_weight over a grid.
+    """Two-stage weight selection: sweep ew×tw on a log-spaced 2D grid, then
+    set distance_weight independently based on per-step signal magnitude.
 
-    Selection criteria (in priority order):
-      1. All successful episodes must have positive total reward (goal dominates).
-      2. Median penalty fraction among successes should be in [10%, 30%] of
-         goal_reward — penalties matter but don't dominate.
-      3. Balance: each active penalty contributes >= 25% of total penalty.
-      4. Maximize reward std among successful episodes only — so the offline
-         algorithm can differentiate efficient vs inefficient goal-reaching.
+    Stage 1 — energy_weight × time_weight sweep:
+      Normalizes raw signals to unit variance so the grid covers comparable
+      effect ranges. Uses a log-spaced grid for better dynamic range coverage.
+      Constraints:
+        1. All successful episodes have positive total reward.
+        2. Median penalty fraction in [10%, 30%] of goal_reward.
+      Objective: maximize std(reward) among successful episodes.
 
-    Falls back to relaxed constraints if nothing meets the strict criteria.
+    Stage 2 — distance_weight (set independently):
+      Scales dw so the median per-step distance penalty is comparable to the
+      median per-step energy+time penalty. This ensures dense learning signal
+      without needing to jointly optimize — distance serves a fundamentally
+      different purpose (per-step gradient) than energy/time (trajectory quality).
     """
     action_norms_per_ep = []
     dist_sums_per_ep = []
@@ -237,115 +361,195 @@ def sweep_weights(data, episodes, goal_reward):
 
     action_norms_per_ep = np.array(action_norms_per_ep)
     dist_sums_per_ep = np.array(dist_sums_per_ep)
-    lengths = np.array(lengths)
+    lengths = np.array(lengths, dtype=float)
     successes = np.array(successes)
     succ_mask = successes.astype(bool)
 
     # Log data ranges.
     print(f'  Action norm totals — min: {action_norms_per_ep.min():.1f}, '
           f'max: {action_norms_per_ep.max():.1f}, mean: {action_norms_per_ep.mean():.1f}')
-    print(f'  Episode lengths    — min: {lengths.min()}, '
-          f'max: {lengths.max()}, mean: {lengths.mean():.0f}')
+    print(f'  Episode lengths    — min: {lengths.min():.0f}, '
+          f'max: {lengths.max():.0f}, mean: {lengths.mean():.0f}')
     print(f'  Dist-to-goal sums  — min: {dist_sums_per_ep.min():.1f}, '
           f'max: {dist_sums_per_ep.max():.1f}, mean: {dist_sums_per_ep.mean():.1f}')
     print(f'  Successful episodes: {succ_mask.sum()} / {len(succ_mask)}')
 
-    # Scale sweep ranges so that at max weight, the median penalty equals goal_reward.
-    succ_norms = action_norms_per_ep[succ_mask] if succ_mask.any() else action_norms_per_ep
-    succ_lens = lengths[succ_mask] if succ_mask.any() else lengths
-    succ_dists = dist_sums_per_ep[succ_mask] if succ_mask.any() else dist_sums_per_ep
+    # --- Normalize raw signals to unit variance ---
+    # This makes the grid uniform in "effect space" so energy and time
+    # axes have comparable scales regardless of raw magnitude differences.
+    norm_std = np.std(action_norms_per_ep[succ_mask]) if succ_mask.sum() > 1 else np.std(action_norms_per_ep)
+    len_std = np.std(lengths[succ_mask]) if succ_mask.sum() > 1 else np.std(lengths)
+    norm_std = max(norm_std, 1e-9)
+    len_std = max(len_std, 1e-9)
 
-    n_grid = 20  # per dimension (20^3 = 8000 combos)
-    ew_max = goal_reward / (np.median(succ_norms) + 1e-9)
-    tw_max = goal_reward / (np.median(succ_lens) + 1e-9)
-    dw_max = goal_reward / (np.median(succ_dists) + 1e-9)
-    ew_vals = np.linspace(0.0, ew_max, n_grid)
-    tw_vals = np.linspace(0.0, tw_max, n_grid)
-    dw_vals = np.linspace(0.0, dw_max, n_grid)
+    normed_energy = action_norms_per_ep / norm_std  # unit-variance
+    normed_time = lengths / len_std
+
+    print(f'  Normalization — energy_std: {norm_std:.2f}, length_std: {len_std:.2f}')
+
+    # --- Estimate distance budget ---
+    # We'll reserve headroom for distance in Stage 1. Estimate the ratio of
+    # median per-step distance to median per-step (energy+time) so we know
+    # roughly how much penalty budget distance will need at target_ratio=1.0.
+    # With target_ratio=1.0, distance penalty ≈ energy+time penalty in total,
+    # so we need to reserve ~50% of the total penalty budget for distance.
+    # Use a conservative 1/3 reservation (distance gets 1/3, energy+time get 2/3).
+    dist_budget_fraction = 1.0 / 3.0
+
+    # --- Stage 1: Log-spaced 2D sweep over ew_norm × tw_norm ---
+    # Weights are in normalized space; real weights = w_norm / std.
+    # At max normalized weight, median penalty ≈ goal_reward.
+    succ_normed_energy = normed_energy[succ_mask] if succ_mask.any() else normed_energy
+    succ_normed_time = normed_time[succ_mask] if succ_mask.any() else normed_time
+
+    n_grid = 40  # 40×40 = 1600 combos (fast, much finer than old 20×20 slice)
+    ew_norm_max = goal_reward / (np.median(succ_normed_energy) + 1e-9)
+    tw_norm_max = goal_reward / (np.median(succ_normed_time) + 1e-9)
+
+    # Log-spaced from a small fraction to max, plus zero.
+    ew_norm_min = ew_norm_max * 1e-3
+    tw_norm_min = tw_norm_max * 1e-3
+    ew_norm_vals = np.concatenate([[0.0], np.geomspace(ew_norm_min, ew_norm_max, n_grid - 1)])
+    tw_norm_vals = np.concatenate([[0.0], np.geomspace(tw_norm_min, tw_norm_max, n_grid - 1)])
 
     best_combo = None
     best_spread = -1.0
 
-    for lo, hi in [(0.10, 0.30), (0.05, 0.50), (0.0, 1.0)]:
-        for min_balance in [0.25, 0.1, 0.0]:
-            for ew in ew_vals:
-                for tw in tw_vals:
-                    for dw in dw_vals:
-                        if ew == 0 and tw == 0 and dw == 0:
-                            continue
+    g = successes.astype(float) * goal_reward  # precompute goal vector
 
-                        g = successes.astype(float) * goal_reward
-                        e = -ew * action_norms_per_ep
-                        t = -tw * lengths
-                        d = -dw * dist_sums_per_ep
-                        total = g + e + t + d
+    # Penalty fraction targets for energy+time only (leaving room for distance).
+    et_frac_bands = [
+        (0.10 * (1 - dist_budget_fraction), 0.30 * (1 - dist_budget_fraction)),
+        (0.05 * (1 - dist_budget_fraction), 0.50 * (1 - dist_budget_fraction)),
+        (0.0, 1.0),
+    ]
+    for lo, hi in et_frac_bands:
+        for ew_n in ew_norm_vals:
+            for tw_n in tw_norm_vals:
+                if ew_n == 0 and tw_n == 0:
+                    continue
 
-                        if not succ_mask.any():
-                            continue
+                total = g - ew_n * normed_energy - tw_n * normed_time
 
-                        succ_total = total[succ_mask]
+                if not succ_mask.any():
+                    continue
 
-                        # Constraint 1: all successful eps must have positive reward.
-                        if np.any(succ_total <= 0):
-                            continue
+                succ_total = total[succ_mask]
 
-                        # Constraint 2: median penalty fraction in [lo, hi].
-                        succ_penalties = goal_reward - succ_total
-                        med_frac = float(np.median(succ_penalties)) / goal_reward
-                        if not (lo <= med_frac <= hi):
-                            continue
+                # Constraint 1: all successful eps positive reward (with headroom
+                # for distance — require at least dist_budget_fraction of
+                # goal_reward remaining).
+                min_headroom = goal_reward * dist_budget_fraction
+                if np.any(succ_total <= min_headroom):
+                    continue
 
-                        # Constraint 3: balance among active components.
-                        active = []
-                        if ew > 0:
-                            active.append(np.median(np.abs(e[succ_mask])))
-                        if tw > 0:
-                            active.append(np.median(np.abs(t[succ_mask])))
-                        if dw > 0:
-                            active.append(np.median(np.abs(d[succ_mask])))
+                # Constraint 2: median ew+tw penalty fraction in [lo, hi].
+                succ_penalties = goal_reward - succ_total
+                med_frac = float(np.median(succ_penalties)) / goal_reward
+                if not (lo <= med_frac <= hi):
+                    continue
 
-                        if len(active) >= 2:
-                            total_active = sum(active)
-                            if total_active > 1e-12:
-                                fracs = [a / total_active for a in active]
-                                if any(f < min_balance for f in fracs):
-                                    continue
+                spread = float(np.std(succ_total))
+                if spread > best_spread:
+                    best_spread = spread
+                    best_combo = (ew_n, tw_n, med_frac, spread)
 
-                        spread = float(np.std(succ_total))
-                        if spread > best_spread:
-                            best_spread = spread
-                            best_combo = (ew, tw, dw, med_frac, spread)
-
-            if best_combo is not None:
-                print(f'  Selection: penalty frac [{lo:.0%}, {hi:.0%}], '
-                      f'balance>={min_balance:.0%}, '
-                      f'best success_std={best_spread:.4f}')
-                break
         if best_combo is not None:
+            print(f'  Stage 1 selection: ew+tw penalty frac [{lo:.0%}, {hi:.0%}] '
+                  f'(reserving {dist_budget_fraction:.0%} for distance), '
+                  f'best success_std={best_spread:.4f}')
             break
 
     if best_combo is None:
-        # Unconstrained fallback: just maximize spread.
-        print('  Selection: unconstrained fallback (no combo met criteria)')
-        for ew in ew_vals:
-            for tw in tw_vals:
-                for dw in dw_vals:
-                    if ew == 0 and tw == 0 and dw == 0:
-                        continue
-                    g = successes.astype(float) * goal_reward
-                    total = g - ew * action_norms_per_ep - tw * lengths - dw * dist_sums_per_ep
-                    if succ_mask.any():
-                        spread = float(np.std(total[succ_mask]))
-                        if spread > best_spread:
-                            best_spread = spread
-                            succ_total = total[succ_mask]
-                            med_frac = float(np.median(goal_reward - succ_total)) / goal_reward
-                            best_combo = (ew, tw, dw, med_frac, spread)
+        # Unconstrained fallback: maximize spread.
+        print('  Stage 1: unconstrained fallback (no combo met criteria)')
+        for ew_n in ew_norm_vals:
+            for tw_n in tw_norm_vals:
+                if ew_n == 0 and tw_n == 0:
+                    continue
+                total = g - ew_n * normed_energy - tw_n * normed_time
+                if succ_mask.any():
+                    spread = float(np.std(total[succ_mask]))
+                    if spread > best_spread:
+                        best_spread = spread
+                        succ_total = total[succ_mask]
+                        med_frac = float(np.median(goal_reward - succ_total)) / goal_reward
+                        best_combo = (ew_n, tw_n, med_frac, spread)
 
-    best_ew, best_tw, best_dw = best_combo[0], best_combo[1], best_combo[2]
+    # --- Refine: fine grid around best combo ---
+    coarse_ew_n, coarse_tw_n = best_combo[0], best_combo[1]
+    refine_n = 20
+    refine_ew = np.linspace(max(coarse_ew_n * 0.5, 0), coarse_ew_n * 1.5, refine_n)
+    refine_tw = np.linspace(max(coarse_tw_n * 0.5, 0), coarse_tw_n * 1.5, refine_n)
+
+    for ew_n in refine_ew:
+        for tw_n in refine_tw:
+            if ew_n == 0 and tw_n == 0:
+                continue
+            total = g - ew_n * normed_energy - tw_n * normed_time
+            if not succ_mask.any():
+                continue
+            succ_total = total[succ_mask]
+            if np.any(succ_total <= 0):
+                continue
+            succ_penalties = goal_reward - succ_total
+            med_frac = float(np.median(succ_penalties)) / goal_reward
+            spread = float(np.std(succ_total))
+            if spread > best_spread:
+                best_spread = spread
+                best_combo = (ew_n, tw_n, med_frac, spread)
+
+    best_ew_n, best_tw_n = best_combo[0], best_combo[1]
+
+    # Convert normalized weights back to real weights.
+    best_ew = best_ew_n / norm_std
+    best_tw = best_tw_n / len_std
+
+    print(f'  Stage 1 result: ew={best_ew:.6f}, tw={best_tw:.6f} '
+          f'(normed: ew_n={best_ew_n:.4f}, tw_n={best_tw_n:.4f})')
+
+    # --- Stage 2: Set distance_weight from per-step signal ratio ---
+    best_dw = _compute_distance_weight(
+        data, episodes, succ_mask, action_norms_per_ep, lengths,
+        energy_weight=best_ew, time_weight=best_tw, target_ratio=1.0)
+
+    # Verify adding distance doesn't break the positivity constraint.
+    # Use the reserved budget: distance penalty should use at most
+    # dist_budget_fraction of goal_reward for the *median* successful episode.
+    # We allow some worst-case episodes to go slightly negative if needed —
+    # the dense signal value outweighs perfect positivity for outlier episodes.
+    if succ_mask.any() and best_dw > 0:
+        median_dist_sum = np.median(dist_sums_per_ep[succ_mask])
+        budget = goal_reward * dist_budget_fraction
+        max_dw_from_budget = budget / (median_dist_sum + 1e-12)
+
+        if best_dw > max_dw_from_budget:
+            print(f'  Stage 2: capped dw from {best_dw:.6f} to {max_dw_from_budget:.6f} '
+                  f'(median distance budget = {dist_budget_fraction:.0%} of goal_reward)')
+            best_dw = max_dw_from_budget
+
+        # Hard check: at least 90% of successful eps must stay positive.
+        total_with_dist = (g - best_ew * action_norms_per_ep
+                           - best_tw * lengths
+                           - best_dw * dist_sums_per_ep)
+        succ_positive_frac = np.mean(total_with_dist[succ_mask] > 0)
+        if succ_positive_frac < 0.90:
+            # Scale down to hit 90% threshold using the 90th percentile dist sum.
+            p90_dist = np.percentile(dist_sums_per_ep[succ_mask], 90)
+            headroom = (goal_reward - best_ew * action_norms_per_ep[succ_mask]
+                        - best_tw * lengths[succ_mask])
+            p90_headroom = np.percentile(headroom, 10)  # 10th percentile = tightest
+            safe_dw = max(p90_headroom / (p90_dist + 1e-12) * 0.95, 0.0)
+            print(f'  Stage 2: further scaled dw to {safe_dw:.6f} '
+                  f'(90% positivity constraint, was {succ_positive_frac:.0%})')
+            best_dw = safe_dw
+
+    print(f'  Stage 2 result: dw={best_dw:.6f} (per-step signal targeting '
+          f'1.0x energy+time magnitude)')
 
     return dict(
-        ew_vals=ew_vals, tw_vals=tw_vals, dw_vals=dw_vals,
+        ew_vals=ew_norm_vals / norm_std, tw_vals=tw_norm_vals / len_std,
+        dw_vals=np.array([best_dw]),
         best_ew=best_ew, best_tw=best_tw, best_dw=best_dw,
         best_spread=best_spread,
         # Pass per-episode data for plots.
@@ -442,8 +646,14 @@ def print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
     if ep_total.std() < 0.05:
         print('  [!] Very low reward variance — trajectories are indistinguishable. Increase weights.')
     succ_negative = ((ep_goal > 0) & (ep_total < 0)).sum()
-    if succ_negative > 0:
-        print(f'  [!] {succ_negative} successful episodes have negative total reward — penalties too high.')
+    n_succ = (ep_goal > 0).sum()
+    if succ_negative > 0 and n_succ > 0:
+        neg_pct = 100 * succ_negative / n_succ
+        if neg_pct > 15:
+            print(f'  [!] {succ_negative} ({neg_pct:.0f}%) successful episodes have negative total reward — penalties may be too high.')
+        else:
+            print(f'  [i] {succ_negative} ({neg_pct:.0f}%) successful episodes have negative total reward '
+                  f'(expected for long/inefficient trajectories with dense distance signal).')
     elif (ep_total < 0).mean() > 0.5:
         print('  [!] >50% of all episodes have negative total reward.')
 
