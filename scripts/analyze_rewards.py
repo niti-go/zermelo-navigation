@@ -148,10 +148,14 @@ def _get_dist_to_goal(data):
     """Return per-step distance-to-goal array, computing from obs if not stored."""
     if 'dist_to_goal' in data:
         return data['dist_to_goal']
-    # obs[:, :2] = agent xy, obs[:, 2:4] = goal xy
+    # Fallback for datasets without dist_to_goal stored.
+    # obs layout: [qpos_x, qpos_y, flow_vx, flow_vy, goal_x, goal_y]
     qpos = data['qpos']
-    obs = data['observations']
-    goal_xy = obs[:, 2:4]
+    if 'goal_xy' in data:
+        goal_xy = data['goal_xy']
+    else:
+        obs = data['observations']
+        goal_xy = obs[:, 4:6]
     return np.linalg.norm(qpos - goal_xy, axis=1)
 
 

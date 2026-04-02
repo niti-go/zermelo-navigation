@@ -13,8 +13,11 @@ class FlowField:
 
     def __init__(self, flow_field_path=None):
         if flow_field_path is None:
-            flow_field_path = os.path.join(os.path.dirname(__file__), 'assets', 'yellow_path_field.npy')
-        data = np.load(flow_field_path, allow_pickle=True).item()
+            flow_field_path = os.path.join(os.path.dirname(__file__), 'assets', 'yellow_path_field.npz')
+        if flow_field_path.endswith('.npz'):
+            data = dict(np.load(flow_field_path))
+        else:
+            data = np.load(flow_field_path, allow_pickle=True).item()
         self.x_range = data['x_range']
         self.y_range = data['y_range']
         self.vx_grid = data['vx_grid']
@@ -272,35 +275,30 @@ def generate_yellow_path_field(save_path=None):
     vx = np.zeros_like(xx)
     vy = np.zeros_like(yy)
     
-    # Top middle area (x < 6): strong upward flow to push agent toward top route
+    # Top middle area (x < 6): upward flow to push agent toward top route
     left_mask = (xx >= -4) & (xx < 6) & (yy<=20)
-    vx[left_mask] = -0.3
-    vy[left_mask] = 1.5  # upward (positive = up)
+    vx[left_mask] = -0.15
+    vy[left_mask] = 0.75  # upward (positive = up)
 
-    # Left column (x < 6): strong upward flow to push agent toward top route
-    left_mask = (xx >= -4) & (xx < 6) & (yy<=20)
-    vx[left_mask] = -0.3
-    vy[left_mask] = 1.5  # upward (positive = up)
-
-    # Top region (y > 14): strong rightward flow across the top
+    # Top region (y > 14): rightward flow across the top
     top_mask = (yy > 14)
-    vx[top_mask] = 1.8  # rightward
-    vy[top_mask] = -0.2  # slight downward
+    vx[top_mask] = 0.9  # rightward
+    vy[top_mask] = -0.1  # slight downward
 
     # Right column (x > 14): downward flow toward goal area
     right_mask = (xx > 14)
-    vx[right_mask] = 0.2
-    vy[right_mask] = +1.2  # downward (negative = down)
+    vx[right_mask] = 0.1
+    vy[right_mask] = 0.6
 
-    # Bottom region (y < 6): leftward flow
+    # Bottom region (y < 6): rightward flow
     bottom_mask = (yy < 6)
-    vx[bottom_mask] = 0.2  # rightward
-    vy[bottom_mask] = 0.6 # slight upward
+    vx[bottom_mask] = 0.1
+    vy[bottom_mask] = 0.3
 
-    # Middle corridor (6 < x < 14, 6 < y < 13): leftward + upward to block green path
+    # Middle corridor (6 < x < 14, 6 < y < 13): leftward + downward to block green path
     middle_mask = (xx > 6) & (xx < 14) & (yy > 6) & (yy < 14)
-    vx[middle_mask] = -1.0  # leftward blocks direct path
-    vy[middle_mask] = -1.0  # upward pushes toward yellow route
+    vx[middle_mask] = -0.5
+    vy[middle_mask] = -0.5
 
     return _save_field(save_path, x_range, y_range, vx, vy, 'yellow path field')
 

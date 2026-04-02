@@ -422,7 +422,8 @@ def make_zermelo_maze_env(*args, **kwargs):
         def get_ob(self, ob_type=None):
             ob_type = self._ob_type if ob_type is None else ob_type
             if ob_type == 'states':
-                return super().get_ob()
+                base_ob = super().get_ob()  # [qpos_x, qpos_y, flow_vx, flow_vy]
+                return np.concatenate([base_ob, self.cur_goal_xy])
             else:
                 return self.render()
 
@@ -440,7 +441,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             else:
                 self.cur_goal_xy = goal_xy
             if self._ob_type == 'states':
-                self.model.geom('target').pos[:2] = goal_xy
+                self.model.geom('target').pos[:2] = self.cur_goal_xy
 
         def get_oracle_subgoal(self, start_xy, goal_xy):
             start_ij = self.xy_to_ij(start_xy)

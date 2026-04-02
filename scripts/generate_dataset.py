@@ -259,8 +259,8 @@ def main(_):
         )
 
         ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
-        # Point the env's goal at the final destination (for success/reward).
-        env.unwrapped.set_goal(goal_ij)
+        # Ensure the env's goal matches what reset() chose (don't re-noise).
+        # reset() already set cur_goal_xy with noise; just keep it.
 
         done = False
         step = 0
@@ -321,9 +321,13 @@ def main(_):
             ep_dists.append(step_dist)
 
             dataset['observations'].append(ob)
+            dataset['next_observations'].append(next_ob)
             dataset['actions'].append(action)
             dataset['rewards'].append(reward)
-            dataset['terminals'].append(done)
+            dataset['terminals'].append(float(done))
+            # masks: 0.0 if truly terminated (goal reached), 1.0 if truncated (max steps).
+            # This tells the RL algorithm whether to bootstrap from the next state.
+            dataset['masks'].append(0.0 if terminated else 1.0)
             dataset['qpos'].append(info['prev_qpos'])
             dataset['qvel'].append(info['prev_qvel'])
             dataset['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
