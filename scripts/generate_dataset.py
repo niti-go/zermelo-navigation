@@ -46,11 +46,12 @@ flags.DEFINE_string('config', None, 'Path to zermelo_config.yaml (optional; uses
 
 def bfs_reachable(maze_map, start_ij):
     """Return BFS distance map from start_ij. Unreachable cells have value -1."""
+    from collections import deque
     dist = np.full_like(maze_map, -1)
     dist[start_ij[0], start_ij[1]] = 0
-    queue = [start_ij]
+    queue = deque([start_ij])
     while queue:
-        i, j = queue.pop(0)
+        i, j = queue.popleft()
         for di, dj in [(-1, 0), (0, -1), (1, 0), (0, 1)]:
             ni, nj = i + di, j + dj
             if (0 <= ni < maze_map.shape[0] and 0 <= nj < maze_map.shape[1]
@@ -60,19 +61,42 @@ def bfs_reachable(maze_map, start_ij):
     return dist
 
 
+def precompute_bfs_cache(maze_map, all_cells):
+    """Pre-compute BFS distance maps from every free cell. Returns dict: cell -> dist_map."""
+    cache = {}
+    for cell in all_cells:
+        cache[cell] = bfs_reachable(maze_map, cell)
+    return cache
+
+
+def oracle_subgoal_from_cache(agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy):
+    """BFS oracle subgoal using pre-computed cache instead of recomputing BFS each step."""
+    agent_ij = xy_to_ij(agent_xy)
+    bfs_map = bfs_cache[target_ij]
+    best_ij = agent_ij
+    rows, cols = maze_map.shape
+    for di, dj in [(-1, 0), (0, -1), (1, 0), (0, 1)]:
+        ni, nj = agent_ij[0] + di, agent_ij[1] + dj
+        if (0 <= ni < rows and 0 <= nj < cols
+                and maze_map[ni, nj] == 0
+                and bfs_map[ni, nj] < bfs_map[best_ij[0], best_ij[1]]):
+            best_ij = (ni, nj)
+    return np.array(ij_to_xy(best_ij))
+
+
 def sample_reachable_waypoints(maze_map, all_cells, start_ij, goal_ij,
-                               max_waypoints, max_detour):
+                               max_waypoints, max_detour, bfs_cache):
     """Sample 0..max_waypoints waypoints that don't create absurd detours."""
     n_waypoints = np.random.randint(0, max_waypoints + 1)
     if n_waypoints == 0:
         return []
 
-    dist_to_goal = bfs_reachable(maze_map, goal_ij)
+    dist_to_goal = bfs_cache[goal_ij]
 
     waypoints = []
     current = start_ij
     for _ in range(n_waypoints):
-        dist_from_current = bfs_reachable(maze_map, current)
+        dist_from_current = bfs_cache[current]
         direct = dist_from_current[goal_ij[0], goal_ij[1]]
         if direct <= 0:
             break
@@ -178,7 +202,7 @@ def main(_):
 
     env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
 
-    # Collect free cells.
+    # Collect free cells and pre-compute BFS cache.
     all_cells = []
     maze_map = env.unwrapped.maze_map
     for i in range(maze_map.shape[0]):
@@ -187,6 +211,12 @@ def main(_):
                 all_cells.append((i, j))
 
     maze_enabled = cfg['maze']['enabled']
+
+    if maze_enabled:
+        print(f'Pre-computing BFS cache for {len(all_cells)} free cells...')
+        bfs_cache = precompute_bfs_cache(maze_map, all_cells)
+        xy_to_ij = env.unwrapped.xy_to_ij
+        ij_to_xy = env.unwrapped.ij_to_xy
 
     # Compute continuous XY bounds for open-arena waypoint sampling.
     if not maze_enabled:
@@ -234,7 +264,7 @@ def main(_):
         if maze_enabled:
             waypoints_ij = sample_reachable_waypoints(
                 maze_map, all_cells, init_ij, goal_ij,
-                traj_cfg['max_waypoints'], traj_cfg['max_detour'],
+                traj_cfg['max_waypoints'], traj_cfg['max_detour'], bfs_cache,
             )
             # Full route as grid cells: start -> waypoints -> goal.
             route_ij = waypoints_ij + [goal_ij]
@@ -291,7 +321,9 @@ def main(_):
 
             # Get direction toward the current target.
             if maze_enabled:
-                subgoal_xy, _ = env.unwrapped.get_oracle_subgoal(agent_xy, current_target_xy)
+                target_ij = xy_to_ij(current_target_xy)
+                subgoal_xy = oracle_subgoal_from_cache(
+                    agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy)
             else:
                 # Open arena: steer directly toward the target.
                 subgoal_xy = current_target_xy

@@ -35,8 +35,9 @@ maze:
 
 # --- Flow field -------------------------------------------------------------
 flow:
-  field_path: null                # path to a .npy flow field file; null = built-in default
-  #create a custom flow field using zermelo_flow.py
+  field_path: zermelo_env/assets/taylor_green_field.npz
+  # set to null for built-in default (yellow_path_field.npz)
+  # create a custom flow field using: python zermelo_env/zermelo_flow.py --name taylor_green
 
 # --- Start / goal -----------------------------------------------------------
 start_goal:
@@ -47,9 +48,9 @@ start_goal:
 # --- Reward -----------------------------------------------------------------
 reward:
   goal_reward: 100.0                # sparse reward on reaching the goal
-  energy_weight: 0.0              # penalty per unit of action magnitude per step
-  time_weight: 0.0                # constant per-step penalty
-  distance_weight: 0.0            # per-step penalty proportional to distance from goal
+  energy_weight: 0.00805            # penalty per unit of action magnitude per step
+  time_weight: 0.09455               # constant per-step penalty
+  distance_weight: 0.01529           # per-step penalty proportional to distance from goal
   # The drift threshold is just an informational logging feature, it doesn't affect the reward or dynamics at all.
   # It helps visualize what fraction of a trajectory involves active control vs passive drift
   drift_threshold: 0.01           # action norm below this counts as "drifting".
@@ -70,7 +71,7 @@ env:
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 200
+  num_episodes: 20000
   max_episode_steps: 1001
   save_path: datasets/zermelo_pointmaze_medium.npz #run this from the repo root
 

@@ -11,41 +11,44 @@ conda activate zermelo
 cd ~/zermelo-navigation
 PYTHONPATH=. python scripts/generate_dataset.py
 
-# 3. Tune reward weights with the analysis script
+# 3. Find good reward weights using the analysis script
 PYTHONPATH=. python scripts/analyze_rewards.py
-#    Look at the recommended weights in the output and plots in datasets/hyperparameter_tuning/.
-#    Then update configs/zermelo_config.yaml with the recommended values:
-#      reward:
-#        energy_weight: <recommended ew>
-#        time_weight:   <recommended tw>
-#        distance_weight: <recommended dw>
+#    Check the recommended weights in the output and plots in datasets/hyperparameter_tuning/.
 
-# 4. Regenerate the dataset with the tuned reward weights
-PYTHONPATH=. python scripts/generate_dataset.py
+# 4. Recompute rewards in the existing dataset (no regeneration needed)
+PYTHONPATH=. python scripts/recompute_rewards.py \
+    --energy_weight=<recommended ew> \
+    --time_weight=<recommended tw> \
+    --distance_weight=<recommended dw>
+    
+# 5 Visualize trajectories from the dataset (optional)
+PYTHONPATH=. python scripts/visualize.py
+This saves a video of 5 random trajectories to datasets/video.mp4
 
-# 5. Train MeanFlowQL (uses flowrl conda env, can run from any directory)
+# 6. Train MeanFlowQL (uses flowrl conda env, can run from any directory)
 conda activate flowrl
 wandb login
-CUDA_VISIBLE_DEVICES=0 python ~/zermelo-navigation/experiments/offline_baselines/meanflowql_zermelo.py \
+CUDA_VISIBLE_DEVICES=0 python ~/zermelo-navigation/experiments/zermelo/meanflowql_zermelo.py \
     --offline_steps=1000000 \
     --seed=0 \
     --save_interval=50000 \
     --agent.alpha=2000 \
     --agent.num_candidates=5 \
-    --proj_wandb=meanflowql_zermelo \
-    --run_group=meanflowql_zermelo \
+    --proj_wandb=zermelo \
+    --run_group=meanflowql \
     --wandb_online=True
 
 #    The --zermelo_dataset flag defaults to the path in zermelo_config.yaml
 #    (datasets/zermelo_pointmaze_medium.npz). Pass explicitly if using a different file:
 #    --zermelo_dataset=/path/to/my_custom_dataset.npz
 
-# 6. Detach tmux: Ctrl+b, then d
-# 7. Reattach later: tmux attach -t meanflowql_zermelo
+# 7. Detach tmux: Ctrl+b, then d
+# 8. Reattach later: tmux attach -t meanflowql_zermelo
 
 === WANDB LOGGING ===
-  Project: --proj_wandb  (default: meanflowql_zermelo)
-  Group:   --run_group   (default: meanflowql_zermelo)
+  Entity:  --wandb_entity (default: RL_Control_JX)
+  Project: --proj_wandb   (default: zermelo)
+  Group:   --run_group    (default: meanflowql)
   Mode:    --wandb_online (default: True, set False for offline logging)
 
 === CHECKPOINTS ===
@@ -94,10 +97,11 @@ from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 FLAGS = flags.FLAGS
 
 # Experiment configuration flags
-flags.DEFINE_string('run_group', 'debug', 'Run group in wandb')
+flags.DEFINE_string('run_group', 'meanflowql', 'Run group in wandb')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'zermelo-pointmaze-medium-v0', 'Environment name.')
-flags.DEFINE_string('proj_wandb', 'meanflowql_zermelo', 'wandb project name')
+flags.DEFINE_string('proj_wandb', 'zermelo', 'wandb project name')
+flags.DEFINE_string('wandb_entity', 'RL_Control_JX', 'wandb entity (team/org). Set to None for personal account.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
 flags.DEFINE_string('wandb_save_dir', 'debug/', 'Wandb offline data save directory.')
 flags.DEFINE_string('restore_path', None, 'Restore path.')
@@ -234,8 +238,10 @@ def main(_):
         os.environ["WANDB_MODE"] = "online"
     else:
         os.environ["WANDB_MODE"] = "offline"
+    entity = FLAGS.wandb_entity if FLAGS.wandb_entity != 'None' else None
     setup_wandb(project=FLAGS.proj_wandb, group=FLAGS.run_group, name=exp_name,
-                mode=os.environ["WANDB_MODE"], wandb_output_dir=FLAGS.wandb_save_dir)
+                entity=entity, mode=os.environ["WANDB_MODE"],
+                wandb_output_dir=FLAGS.wandb_save_dir)
 
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     print(f"Saving results to {FLAGS.save_dir}")

@@ -303,6 +303,46 @@ def generate_yellow_path_field(save_path=None):
     return _save_field(save_path, x_range, y_range, vx, vy, 'yellow path field')
 
 
+def generate_taylor_green_field(save_path=None):
+    """2D Taylor-Green vortex flow field.
+
+    The Taylor-Green vortex is an exact solution to the incompressible
+    Navier-Stokes equations. It produces a periodic array of counter-rotating
+    vortices that create an interesting navigation challenge: the agent can
+    ride favorable vortex currents or must fight against opposing ones.
+
+        vx =  A * cos(kx * x) * sin(ky * y)
+        vy = -A * sin(kx * x) * cos(ky * y)
+
+    Divergence-free by construction (∂vx/∂x + ∂vy/∂y = 0).
+
+    With kx = ky = 2π/L, this produces a 2×2 grid of vortices across
+    the maze domain, giving the agent multiple route choices through
+    alternating favorable and adverse currents.
+    """
+    if save_path is None:
+        save_path = os.path.join(os.path.dirname(__file__), 'assets', 'taylor_green_field.npy')
+
+    xs, ys, xx, yy, x_range, y_range = _make_grid()
+
+    # Domain length.
+    Lx = x_range[1] - x_range[0]  # 28.0
+    Ly = y_range[1] - y_range[0]  # 28.0
+
+    # Wavenumbers: 2 full vortex wavelengths across each dimension.
+    kx = 2.0 * np.pi * 2.0 / Lx
+    ky = 2.0 * np.pi * 2.0 / Ly
+
+    # Center the pattern on the domain.
+    xc = xx - (x_range[0] + x_range[1]) / 2.0
+    yc = yy - (y_range[0] + y_range[1]) / 2.0
+
+    vx = np.cos(kx * xc) * np.sin(ky * yc)
+    vy = -np.sin(kx * xc) * np.cos(ky * yc)
+
+    return _save_field(save_path, x_range, y_range, vx, vy, 'Taylor-Green vortex field')
+
+
 ALL_GENERATORS = {
     'default': generate_default_flow_field,
     'double_vortex': generate_double_vortex_field,
@@ -311,6 +351,7 @@ ALL_GENERATORS = {
     'sink_source': generate_sink_source_field,
     'turbulent': generate_turbulent_field,
     'yellow_path': generate_yellow_path_field,
+    'taylor_green': generate_taylor_green_field,
 }
 
 
