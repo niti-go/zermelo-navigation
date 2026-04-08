@@ -51,8 +51,11 @@ def find_episode_boundaries(terminals):
 
 
 def replay_episode(env, qpos_array):
+    dt = env.unwrapped.frame_skip * env.unwrapped.model.opt.timestep
     frames = []
     for t in range(len(qpos_array)):
+        # Update flow arrows to reflect the field at this point in the episode.
+        env.unwrapped.update_flow_arrows(t * dt)
         env.unwrapped.data.qpos[:] = qpos_array[t]
         mujoco.mj_forward(env.unwrapped.model, env.unwrapped.data)
         frame = env.unwrapped.render()

@@ -52,6 +52,10 @@ def load_config(config_path=None):
 def config_to_env_kwargs(cfg):
     """Extract the kwargs that ZermeloMazeEnv.__init__ expects from a config dict."""
     maze_map = cfg['maze']['map'] if cfg['maze']['enabled'] else None
+
+    # Dynamic flow sub-config (may be absent in older YAML files).
+    dynamic_flow_cfg = cfg['flow'].get('dynamic', {})
+
     return dict(
         maze_type=cfg['maze']['type'],
         maze_unit=cfg['maze']['unit'],
@@ -59,6 +63,7 @@ def config_to_env_kwargs(cfg):
         maze_on=cfg['maze']['enabled'],
         maze_map_override=maze_map,
         flow_field_path=cfg['flow']['field_path'],
+        dynamic_flow_cfg=dynamic_flow_cfg,
         fixed_start_goal=cfg['start_goal']['fixed'],
         fixed_init_ij=tuple(cfg['start_goal']['start_ij']),
         fixed_goal_ij=tuple(cfg['start_goal']['goal_ij']),

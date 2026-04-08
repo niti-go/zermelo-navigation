@@ -34,10 +34,33 @@ maze:
   height: 0.5                     # wall height (fraction of unit)
 
 # --- Flow field -------------------------------------------------------------
+# Exactly ONE of the two modes below is active:
+#   1. Static:  dynamic.enabled = false  →  uses field_path (.npy/.npz file)
+#   2. Dynamic: dynamic.enabled = true   →  uses analytic time-varying TGV
+#      (field_path is completely ignored)
 flow:
   field_path: zermelo_env/assets/taylor_green_field.npz
   # set to null for built-in default (yellow_path_field.npz)
   # create a custom flow field using: python zermelo_env/zermelo_flow.py --name taylor_green
+
+  # --- Dynamic (time-varying) flow ------------------------------------------
+  # When enabled, the environment computes an analytic time-varying TGV
+  # at every step. field_path is completely ignored.
+  #
+  # Three temporal effects (mix and match — set to 0 to disable any):
+  #   decay:       exp(-2*nu*k^2 * t)        viscous dissipation
+  #   oscillation: cos(omega * t)             periodic reversal
+  #   translation: vortex pattern drifts at constant velocity (Ux, Uy)
+  dynamic:
+    enabled: true                    # flip to true for spatiotemporal TGV
+    amplitude: 1.8                   # peak velocity magnitude at t=0
+    nu: 0.005                        # viscosity (decay rate); 0 = no decay
+    omega: 0.5                       # oscillation frequency (rad/s); 0 = no oscillation
+    Ux: 0.4                          # vortex pattern drift speed in x; 0 = stationary
+    Uy: 0.6                          # vortex pattern drift speed in y; 0 = stationary
+    n_vortices: 2                    # number of full vortex wavelengths per dim
+    x_range: [-4.0, 24.0]           # spatial domain (should match arena)
+    y_range: [-4.0, 24.0]
 
 # --- Start / goal -----------------------------------------------------------
 start_goal:
@@ -71,9 +94,9 @@ env:
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 20000
+  num_episodes: 30
   max_episode_steps: 1001
-  save_path: datasets/zermelo_pointmaze_medium.npz #run this from the repo root
+  save_path: datasets/zermelo_dynamic_30.npz #run this from the repo root
 
 # --- Trajectory diversity (data generation only) ----------------------------
 trajectory:

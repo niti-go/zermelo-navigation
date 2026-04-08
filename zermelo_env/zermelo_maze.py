@@ -6,8 +6,14 @@ import mujoco
 import numpy as np
 from gymnasium.spaces import Box
 
-from zermelo_env.zermelo_flow import FlowField
+from zermelo_env.zermelo_flow import DynamicTGVFlowField, FlowField
 from zermelo_env.zermelo_point import ZermeloPointEnv
+
+
+def _euler_z_to_quat(angle):
+    """Convert a Z-axis rotation (radians) to a MuJoCo quaternion [w, x, y, z]."""
+    half = angle / 2.0
+    return [math.cos(half), 0.0, 0.0, math.sin(half)]
 
 
 def make_zermelo_maze_env(*args, **kwargs):
@@ -40,6 +46,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             use_oracle_rep=False,
             flow_field_path=None,
             include_flow_in_obs=True,
+            dynamic_flow_cfg=None,
             fixed_start_goal=False,
             fixed_init_ij=(6, 1),
             fixed_goal_ij=(1, 6),
@@ -85,8 +92,12 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._noise = 1
             self._goal_tol = goal_tolerance
 
-            # Load flow field early for visualization.
-            self._flow_for_arrows = FlowField(flow_field_path)
+            # Load flow field early for arrow visualization.
+            self._dynamic_flow_cfg = dynamic_flow_cfg or {}
+            if self._dynamic_flow_cfg.get('enabled', False):
+                self._flow_for_arrows = DynamicTGVFlowField(self._dynamic_flow_cfg)
+            else:
+                self._flow_for_arrows = FlowField(flow_field_path)
 
             # --- Build maze map ---
             if maze_map_override is not None:
@@ -139,6 +150,7 @@ def make_zermelo_maze_env(*args, **kwargs):
                 xml_file=maze_xml_file,
                 flow_field_path=flow_field_path,
                 include_flow_in_obs=include_flow_in_obs,
+                dynamic_flow_cfg=dynamic_flow_cfg,
                 *args,
                 **kwargs,
             )
@@ -212,6 +224,8 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             # Add flow arrow geoms on a dense sub-grid within each free cell.
             # Place a 3x3 grid of arrows per cell for better coverage.
+            # Store positions so update_flow_arrows() can refresh them at runtime.
+            self._arrow_positions = []
             arrow_idx = 0
             sub_n = 3
             offsets = np.linspace(-self._maze_unit / 3, self._maze_unit / 3, sub_n)
@@ -265,6 +279,7 @@ def make_zermelo_maze_env(*args, **kwargs):
                                     contype='0',
                                     conaffinity='0',
                                 )
+                                self._arrow_positions.append((arrow_idx, x, y))
                                 arrow_idx += 1
 
             # Add target geom for states-based observation.
@@ -280,6 +295,51 @@ def make_zermelo_maze_env(*args, **kwargs):
                     contype='0',
                     conaffinity='0',
                 )
+
+        def update_flow_arrows(self, t=0.0):
+            """Update MuJoCo arrow geoms to reflect the flow field at time *t*.
+
+            Only meaningful when the dynamic flow is active; with a static
+            field the arrows never change, so calling this is a no-op.
+            """
+            if not self._dynamic_flow_cfg.get('enabled', False):
+                return
+            arrow_width = 0.08
+            for arrow_idx, x, y in self._arrow_positions:
+                flow_vx, flow_vy = self._flow_for_arrows.get_flow(x, y, t)
+                mag = math.sqrt(flow_vx ** 2 + flow_vy ** 2)
+
+                if mag < 1e-6:
+                    # Hide the arrow by shrinking it to zero.
+                    self.model.geom(f'flow_arrow_{arrow_idx}').size[:] = [0, 0, 0]
+                    self.model.geom(f'flow_head_{arrow_idx}').size[:] = [0, 0, 0]
+                    continue
+
+                angle = math.atan2(flow_vy, flow_vx)
+                arrow_len = min(mag * 0.55, 1.0)
+
+                # Color: blue (slow) → red (fast).
+                c = min(mag / 1.8, 1.0)
+                r_col, g_col, b_col = c, 0.2, 1.0 - c
+
+                # --- Shaft ---
+                shaft = self.model.geom(f'flow_arrow_{arrow_idx}')
+                shaft.size[:] = [arrow_len / 2, arrow_width / 2, 0.02]
+                shaft.pos[:] = [x, y, 0.05]
+                # MuJoCo stores orientation as a quaternion on the *body*,
+                # but geom euler is baked at compile time.  For geoms
+                # attached to the world body we can set the quat directly.
+                shaft.quat[:] = _euler_z_to_quat(angle)
+                shaft.rgba[:] = [r_col, g_col, b_col, 0.7]
+
+                # --- Head ---
+                head = self.model.geom(f'flow_head_{arrow_idx}')
+                tip_x = x + math.cos(angle) * arrow_len * 0.5
+                tip_y = y + math.sin(angle) * arrow_len * 0.5
+                head.size[:] = [arrow_width, arrow_width * 1.2, 0.02]
+                head.pos[:] = [tip_x, tip_y, 0.05]
+                head.quat[:] = _euler_z_to_quat(angle)
+                head.rgba[:] = [r_col, g_col, b_col, 0.9]
 
         def set_tasks(self):
             if self._maze_type == 'medium':

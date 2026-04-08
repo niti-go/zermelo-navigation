@@ -52,11 +52,14 @@ These two weights control trajectory quality differentiation. We sweep a 2D
 grid of (energy_weight, time_weight) combinations and pick the one that
 maximizes reward variance among successful episodes, subject to:
 
-  - All successful episodes retain enough headroom (positive reward minus a
-    budget reserved for the distance penalty that will be added in Stage 2).
-  - The median penalty fraction is moderate (not negligible, not dominant).
+  - All successful episodes keep reward above goal_reward/3 after subtracting energy+time
+    penalties. That leftover third is reserved for the distance penalty added
+    in Stage 2 (so the total can stay positive once all three penalties apply).
+  - The median energy+time penalty fraction falls in a moderate band (the code
+    tries 10%-30% first, relaxing to wider bands if no combo qualifies).
 
-To make the grid meaningful, raw signals are normalized to unit variance
+To make the grid meaningful, raw signals (raw total action norms (energy)
+and raw step counts (time)) are normalized to unit variance
 before sweeping. This ensures the grid covers comparable effect ranges for
 both axes regardless of their raw magnitude differences. The grid is
 log-spaced for better coverage across dynamic ranges, and a refinement pass

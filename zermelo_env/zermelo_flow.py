@@ -42,6 +42,85 @@ class FlowField:
         return vx, vy
 
 
+class DynamicTGVFlowField:
+    """Time-dependent 2D Taylor-Green vortex flow field.
+
+    Combines three independent temporal effects (all optional, all config-driven):
+
+      1. **Decay** (viscous dissipation):  exp(-decay * t)
+         Controlled by ``nu`` (kinematic viscosity).  Set ``nu: 0`` to disable.
+
+      2. **Oscillation** (periodic reversal):  cos(omega * t)
+         Controlled by ``omega``.  Set ``omega: 0`` to disable.
+
+      3. **Translation** (drifting vortex lattice):
+         The vortex pattern slides at constant velocity (Ux, Uy).
+         Set both to 0 to keep the pattern stationary.
+
+    Full velocity field:
+
+        xc = (x - cx) - Ux * t          # translated coordinate
+        yc = (y - cy) - Uy * t
+        temporal = cos(omega * t) * exp(-decay * t)
+
+        vx =  A * cos(kx * xc) * sin(ky * yc) * temporal
+        vy = -A * sin(kx * xc) * cos(ky * yc) * temporal
+
+    Remains divergence-free for all t (the spatial structure of the TGV is
+    preserved; translation shifts it and the temporal factor is spatially
+    uniform).
+    """
+
+    def __init__(self, dynamic_cfg):
+        cfg = dynamic_cfg
+        self.amplitude = cfg.get('amplitude', 1.8)
+        self.nu = cfg.get('nu', 0.01)
+        self.omega = cfg.get('omega', 0.0)
+        self.Ux = cfg.get('Ux', 0.0)
+        self.Uy = cfg.get('Uy', 0.0)
+
+        # Domain — match the static grid defaults.
+        self.x_range = np.array(cfg.get('x_range', [-4.0, 24.0]), dtype=np.float64)
+        self.y_range = np.array(cfg.get('y_range', [-4.0, 24.0]), dtype=np.float64)
+
+        Lx = self.x_range[1] - self.x_range[0]
+        Ly = self.y_range[1] - self.y_range[0]
+
+        n_vortices = cfg.get('n_vortices', 2)  # full wavelengths per dimension
+        self.kx = 2.0 * np.pi * n_vortices / Lx
+        self.ky = 2.0 * np.pi * n_vortices / Ly
+
+        # Center of the pattern.
+        self._cx = (self.x_range[0] + self.x_range[1]) / 2.0
+        self._cy = (self.y_range[0] + self.y_range[1]) / 2.0
+
+        # Decay rate.
+        self._decay = 2.0 * self.nu * (self.kx ** 2 + self.ky ** 2)
+
+    def _temporal(self, t):
+        """Combined temporal modulation factor."""
+        return np.cos(self.omega * t) * np.exp(-self._decay * t)
+
+    def get_flow(self, x, y, t=0.0):
+        """Return (vx, vy) at position (x, y) and time t."""
+        xc = (x - self._cx) - self.Ux * t
+        yc = (y - self._cy) - self.Uy * t
+        mod = self._temporal(t)
+        vx = self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
+        vy = -self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        return float(vx), float(vy)
+
+    def get_flow_grid(self, xs, ys, t=0.0):
+        """Return flow on a meshgrid for visualization at time t."""
+        yy, xx = np.meshgrid(ys, xs, indexing='ij')
+        xc = (xx - self._cx) - self.Ux * t
+        yc = (yy - self._cy) - self.Uy * t
+        mod = self._temporal(t)
+        vx = self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
+        vy = -self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        return vx, vy
+
+
 MAX_FLOW_MAGNITUDE = 1.8  # Agent max displacement is 0.2/step; flow displacement = 0.1 * mag.
 
 
