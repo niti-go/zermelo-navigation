@@ -48,19 +48,24 @@ flow:
   # at every step. field_path is completely ignored.
   #
   # Three temporal effects (mix and match — set to 0 to disable any):
-  #   decay:       exp(-2*nu*k^2 * t)        viscous dissipation
-  #   oscillation: cos(omega * t)             periodic reversal
+  #   decay:       exp(-nu*(kx^2+ky^2) * t)  viscous dissipation (NS analytical)
+  #   oscillation: cos(omega * t)             periodic reversal (custom extension)
   #   translation: vortex pattern drifts at constant velocity (Ux, Uy)
   dynamic:
     enabled: true                    # flip to true for spatiotemporal TGV
     amplitude: 1.8                   # peak velocity magnitude at t=0
-    nu: 0.005                        # viscosity (decay rate); 0 = no decay
-    omega: 0.5                       # oscillation frequency (rad/s); 0 = no oscillation
-    Ux: 0.4                          # vortex pattern drift speed in x; 0 = stationary
-    Uy: 0.6                          # vortex pattern drift speed in y; 0 = stationary
+    nu: 0.2                         # viscosity (decay rate); 0 = no decay
+    omega: 0.0                       # oscillation frequency (rad/s); 0 = no oscillation
+    Ux: 0.0                          # vortex pattern drift speed in x; 0 = stationary
+    Uy: 0.0                          # vortex pattern drift speed in y; 0 = stationary
     n_vortices: 2                    # number of full vortex wavelengths per dim
     x_range: [-4.0, 24.0]           # spatial domain (should match arena)
     y_range: [-4.0, 24.0]
+
+    #If you set omega, Ux, and Uy to nonzero values,
+    # it is no longer valid TGV flow (solutions to Navier-Stokes)
+
+    #Also, x_range and y_range must be equal for divergence = 0
 
 # --- Start / goal -----------------------------------------------------------
 start_goal:

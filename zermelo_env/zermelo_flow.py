@@ -45,15 +45,19 @@ class FlowField:
 class DynamicTGVFlowField:
     """Time-dependent 2D Taylor-Green vortex flow field.
 
-    Combines three independent temporal effects (all optional, all config-driven):
+    The base velocity field follows the analytical TGV solution to the
+    incompressible Navier-Stokes equations:
 
-      1. **Decay** (viscous dissipation):  exp(-decay * t)
-         Controlled by ``nu`` (kinematic viscosity).  Set ``nu: 0`` to disable.
+        u =  U0 * sin(kx * x) * cos(ky * y) * exp(-nu*(kx^2+ky^2)*t)
+        v = -U0 * cos(kx * x) * sin(ky * y) * exp(-nu*(kx^2+ky^2)*t)
 
-      2. **Oscillation** (periodic reversal):  cos(omega * t)
-         Controlled by ``omega``.  Set ``omega: 0`` to disable.
+    On top of this, two optional extensions are available (set to 0 to disable):
 
-      3. **Translation** (drifting vortex lattice):
+      1. **Oscillation** (periodic reversal):  cos(omega * t)
+         Controlled by ``omega``.  Not part of the NS solution but useful
+         for creating periodically reversing currents.
+
+      2. **Translation** (drifting vortex lattice):
          The vortex pattern slides at constant velocity (Ux, Uy).
          Set both to 0 to keep the pattern stationary.
 
@@ -61,10 +65,10 @@ class DynamicTGVFlowField:
 
         xc = (x - cx) - Ux * t          # translated coordinate
         yc = (y - cy) - Uy * t
-        temporal = cos(omega * t) * exp(-decay * t)
+        temporal = cos(omega * t) * exp(-nu*(kx^2+ky^2) * t)
 
-        vx =  A * cos(kx * xc) * sin(ky * yc) * temporal
-        vy = -A * sin(kx * xc) * cos(ky * yc) * temporal
+        vx =  A * sin(kx * xc) * cos(ky * yc) * temporal
+        vy = -A * cos(kx * xc) * sin(ky * yc) * temporal
 
     Remains divergence-free for all t (the spatial structure of the TGV is
     preserved; translation shifts it and the temporal factor is spatially
@@ -94,8 +98,10 @@ class DynamicTGVFlowField:
         self._cx = (self.x_range[0] + self.x_range[1]) / 2.0
         self._cy = (self.y_range[0] + self.y_range[1]) / 2.0
 
-        # Decay rate.
-        self._decay = 2.0 * self.nu * (self.kx ** 2 + self.ky ** 2)
+        # Viscous decay rate: nu * (kx^2 + ky^2) from the Navier-Stokes
+        # analytical solution.  With kx = ky = 1 this gives 2*nu, matching
+        # the classical TGV decay exp(-2*nu*t).
+        self._decay = self.nu * (self.kx ** 2 + self.ky ** 2)
 
     def _temporal(self, t):
         """Combined temporal modulation factor."""
@@ -106,8 +112,8 @@ class DynamicTGVFlowField:
         xc = (x - self._cx) - self.Ux * t
         yc = (y - self._cy) - self.Uy * t
         mod = self._temporal(t)
-        vx = self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
-        vy = -self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        vx = self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        vy = -self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
         return float(vx), float(vy)
 
     def get_flow_grid(self, xs, ys, t=0.0):
@@ -116,8 +122,8 @@ class DynamicTGVFlowField:
         xc = (xx - self._cx) - self.Ux * t
         yc = (yy - self._cy) - self.Uy * t
         mod = self._temporal(t)
-        vx = self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
-        vy = -self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        vx = self.amplitude * np.sin(self.kx * xc) * np.cos(self.ky * yc) * mod
+        vy = -self.amplitude * np.cos(self.kx * xc) * np.sin(self.ky * yc) * mod
         return vx, vy
 
 
@@ -390,8 +396,8 @@ def generate_taylor_green_field(save_path=None):
     vortices that create an interesting navigation challenge: the agent can
     ride favorable vortex currents or must fight against opposing ones.
 
-        vx =  A * cos(kx * x) * sin(ky * y)
-        vy = -A * sin(kx * x) * cos(ky * y)
+        vx =  A * sin(kx * x) * cos(ky * y)
+        vy = -A * cos(kx * x) * sin(ky * y)
 
     Divergence-free by construction (∂vx/∂x + ∂vy/∂y = 0).
 
@@ -416,8 +422,8 @@ def generate_taylor_green_field(save_path=None):
     xc = xx - (x_range[0] + x_range[1]) / 2.0
     yc = yy - (y_range[0] + y_range[1]) / 2.0
 
-    vx = np.cos(kx * xc) * np.sin(ky * yc)
-    vy = -np.sin(kx * xc) * np.cos(ky * yc)
+    vx = np.sin(kx * xc) * np.cos(ky * yc)
+    vy = -np.cos(kx * xc) * np.sin(ky * yc)
 
     return _save_field(save_path, x_range, y_range, vx, vy, 'Taylor-Green vortex field')
 
