@@ -6,7 +6,11 @@ import mujoco
 import numpy as np
 from gymnasium.spaces import Box
 
-from zermelo_env.zermelo_flow import DynamicTGVFlowField, FlowField
+from zermelo_env.zermelo_flow import (
+    DynamicNetCDFFlowField,
+    DynamicTGVFlowField,
+    FlowField,
+)
 from zermelo_env.zermelo_point import ZermeloPointEnv
 
 
@@ -95,7 +99,16 @@ def make_zermelo_maze_env(*args, **kwargs):
             # Load flow field early for arrow visualization.
             self._dynamic_flow_cfg = dynamic_flow_cfg or {}
             if self._dynamic_flow_cfg.get('enabled', False):
-                self._flow_for_arrows = DynamicTGVFlowField(self._dynamic_flow_cfg)
+                mode = self._dynamic_flow_cfg.get('mode', 'tgv')
+                if mode == 'netcdf':
+                    self._flow_for_arrows = DynamicNetCDFFlowField(
+                        self._dynamic_flow_cfg.get('netcdf', {}) | {
+                            'x_range': self._dynamic_flow_cfg.get('x_range', [-4.0, 24.0]),
+                            'y_range': self._dynamic_flow_cfg.get('y_range', [-4.0, 24.0]),
+                        }
+                    )
+                else:
+                    self._flow_for_arrows = DynamicTGVFlowField(self._dynamic_flow_cfg)
             else:
                 self._flow_for_arrows = FlowField(flow_field_path)
 
@@ -553,8 +566,11 @@ def make_zermelo_maze_env(*args, **kwargs):
             return x, y
 
         def add_noise(self, xy):
-            random_x = np.random.uniform(low=-self._noise, high=self._noise) * self._maze_unit / 4
-            random_y = np.random.uniform(low=-self._noise, high=self._noise) * self._maze_unit / 4
+            # Uniform within the chosen free cell, inset by the agent's collision
+            # radius (0.7) plus a small buffer so samples don't embed in walls.
+            half_span = self._maze_unit / 2 - 0.8
+            random_x = np.random.uniform(low=-half_span, high=half_span)
+            random_y = np.random.uniform(low=-half_span, high=half_span)
             return xy[0] + random_x, xy[1] + random_y
 
     return ZermeloMazeEnv(*args, **kwargs)

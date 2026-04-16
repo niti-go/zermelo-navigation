@@ -4,7 +4,11 @@ import mujoco
 import numpy as np
 
 from zermelo_env.point import PointEnv
-from zermelo_env.zermelo_flow import DynamicTGVFlowField, FlowField
+from zermelo_env.zermelo_flow import (
+    DynamicNetCDFFlowField,
+    DynamicTGVFlowField,
+    FlowField,
+)
 
 
 class ZermeloPointEnv(PointEnv):
@@ -27,7 +31,16 @@ class ZermeloPointEnv(PointEnv):
         self._use_dynamic_flow = self._dynamic_flow_cfg.get('enabled', False)
 
         if self._use_dynamic_flow:
-            self._flow_field = DynamicTGVFlowField(self._dynamic_flow_cfg)
+            mode = self._dynamic_flow_cfg.get('mode', 'tgv')
+            if mode == 'netcdf':
+                self._flow_field = DynamicNetCDFFlowField(
+                    self._dynamic_flow_cfg.get('netcdf', {}) | {
+                        'x_range': self._dynamic_flow_cfg.get('x_range', [-4.0, 24.0]),
+                        'y_range': self._dynamic_flow_cfg.get('y_range', [-4.0, 24.0]),
+                    }
+                )
+            else:
+                self._flow_field = DynamicTGVFlowField(self._dynamic_flow_cfg)
         else:
             self._flow_field = FlowField(flow_field_path)
 
@@ -44,20 +57,20 @@ class ZermeloPointEnv(PointEnv):
         prev_qpos = self.data.qpos.copy()
         prev_qvel = self.data.qvel.copy()
 
-        action = 0.2 * action
-
-        # Agent's intended displacement
-        self.data.qpos[:] = self.data.qpos + action
-
-        # Flow displacement: dt * flow_velocity
+        # Both agent and flow contribute displacement = dt * velocity.
+        # Raw action ∈ [-1, 1]² is rescaled to an agent velocity with max speed
+        # 2*sqrt(2) ≈ 2.83 w.u./s, comparable to the flow's peak speed.
         dt = self.frame_skip * self.model.opt.timestep
+        agent_vx, agent_vy = 2.0 * action[0], 2.0 * action[1]
+
         x, y = self.data.qpos[0], self.data.qpos[1]
         if self._use_dynamic_flow:
             flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._sim_time)
         else:
             flow_vx, flow_vy = self._flow_field.get_flow(x, y)
-        self.data.qpos[0] += dt * flow_vx
-        self.data.qpos[1] += dt * flow_vy
+
+        self.data.qpos[0] += dt * (agent_vx + flow_vx)
+        self.data.qpos[1] += dt * (agent_vy + flow_vy)
 
         self.data.qvel[:] = np.array([0.0, 0.0])
 
