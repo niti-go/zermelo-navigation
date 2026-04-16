@@ -3,6 +3,14 @@ import os
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
 
+try:
+    import xarray as _xr
+except ImportError:
+    _xr = None
+
+#this will be the default value if we don't provide an override in config
+MAX_FLOW_MAGNITUDE = 1.8  # Agent max displacement is 0.2/step; flow displacement = 0.1 * mag.
+
 """
 To generate a flow field:
 python zermelo_env/zermelo_flow.py --name yellow_path
@@ -127,7 +135,238 @@ class DynamicTGVFlowField:
         return vx, vy
 
 
-MAX_FLOW_MAGNITUDE = 1.8  # Agent max displacement is 0.2/step; flow displacement = 0.1 * mag.
+class DynamicNetCDFFlowField:
+    """Time-varying 2D flow field loaded from a NetCDF (.nc) file.
+
+    Expects a dataset with variables ``u(time, x, y)`` and ``v(time, x, y)``
+    and 1-D coords ``time``, ``x``, ``y`` (e.g. the Diff-FlowFSI HIT datasets:
+    T=800 snapshots on a 512x512 periodic box with x,y in [0, 2pi]).
+
+    The simulation's native domain is remapped to the Zermelo arena
+    ``(x_range, y_range)`` via an affine rescale, with periodic wrap by
+    default (HIT data is periodic).
+
+    Temporal playback is controlled by ``frames_per_step`` — how many HIT
+    snapshots the flow advances per env step.  If ``frames_per_step`` is not
+    given but ``frames_per_episode`` + ``max_episode_steps`` are, they're
+    used to derive it (so one playthrough = frames_per_episode frames over
+    max_episode_steps steps).  ``loop_time`` controls what happens past the
+    last frame (wrap vs. clamp).
+
+    The velocities are also rescaled to ``target_max`` (default 1.8) so they
+    match the magnitude regime the agent expects (agent step = 0.2, flow
+    displacement per step = dt * flow).
+    """
+
+    def __init__(self, cfg):
+        if _xr is None:
+            raise ImportError(
+                'xarray is required for NetCDF flow fields. Install with: '
+                'pip install xarray netCDF4'
+            )
+
+        nc_path = cfg.get('nc_path')
+        if nc_path is None:
+            raise ValueError('dynamic.netcdf.nc_path must be set when using netcdf flow mode.')
+        if not os.path.isabs(nc_path):
+            nc_path = os.path.abspath(nc_path)
+
+        # Lazy-open (don't load the whole 3.2 GB file into memory).
+        self._ds = _xr.open_dataset(nc_path)
+        if 'u' not in self._ds or 'v' not in self._ds:
+            raise ValueError(f"NetCDF file {nc_path} must contain 'u' and 'v' variables.")
+
+        # Native coordinates.
+        self._t_native = np.asarray(self._ds['time'].values, dtype=np.float64)
+        self._x_native = np.asarray(self._ds['x'].values, dtype=np.float64)
+        self._y_native = np.asarray(self._ds['y'].values, dtype=np.float64)
+
+        self._t0 = float(self._t_native[0])
+        self._t_span = float(self._t_native[-1] - self._t_native[0])
+        self._nx = len(self._x_native)
+        self._ny = len(self._y_native)
+
+        # Arena domain the agent lives in.
+        self.x_range = np.array(cfg.get('x_range', [-4.0, 24.0]), dtype=np.float64)
+        self.y_range = np.array(cfg.get('y_range', [-4.0, 24.0]), dtype=np.float64)
+        self._Lx_arena = self.x_range[1] - self.x_range[0]
+        self._Ly_arena = self.y_range[1] - self.y_range[0]
+
+        # Native box size (assume uniform; wrap periodically).
+        self._x_native_min = float(self._x_native[0])
+        self._y_native_min = float(self._y_native[0])
+        self._x_native_max = float(self._x_native[-1])
+        self._y_native_max = float(self._y_native[-1])
+        # Extend by one cell so wrap point matches a periodic grid.
+        self._dx_native = (self._x_native_max - self._x_native_min) / max(self._nx - 1, 1)
+        self._dy_native = (self._y_native_max - self._y_native_min) / max(self._ny - 1, 1)
+        self._Lx_native = (self._x_native_max - self._x_native_min) + self._dx_native
+        self._Ly_native = (self._y_native_max - self._y_native_min) + self._dy_native
+
+        # Spatial tiling: how many copies of the native periodic box fit across
+        # the arena.  1 = one big copy (largest eddies).  N>1 = NxN tiling
+        # (eddies look N times smaller).  Field stays seamless because the
+        # native data is periodic.
+        self._n_tiles = float(cfg.get('n_tiles', 1.0))
+
+        # Temporal playback: frames of HIT data advanced per env step.
+        # Precedence: frames_per_step > (frames_per_episode / max_episode_steps)
+        #           > time_scale (legacy, continuous-time mapping)
+        # Time always loops — at the end of the 800-frame clip we wrap back to
+        # the start so episodes longer than the dataset don't freeze.
+
+        if cfg.get('frames_per_step') is not None:
+            self._frames_per_step = float(cfg['frames_per_step'])
+            self._time_mode = 'frames_per_step'
+        elif cfg.get('frames_per_episode') is not None and cfg.get('max_episode_steps') is not None:
+            self._frames_per_step = (
+                float(cfg['frames_per_episode']) / float(cfg['max_episode_steps'])
+            )
+            self._time_mode = 'frames_per_episode'
+        else:
+            self.time_scale = float(cfg.get('time_scale', 1.0))
+            self._frames_per_step = None
+            self._time_mode = 'time_scale'
+
+        # Env step duration, used to convert the API's sim-time (seconds)
+        # into step count.  The maze wrapper runs at frame_skip=5,
+        # mj_timestep=0.02 => 0.1s/step.
+        self._env_dt = float(cfg.get('env_dt', 0.1))
+
+        # Velocity normalization so magnitudes match the static-field regime.
+        # Uses the global max across all frames (not just frame 0) so no frame
+        # in the dataset exceeds target_max after scaling.
+        target_max = float(cfg.get('target_max', MAX_FLOW_MAGNITUDE))
+        u_max = float(np.max(np.abs(self._ds['u'].values)))
+        v_max = float(np.max(np.abs(self._ds['v'].values)))
+        native_max = max(u_max, v_max, 1e-8)
+        self._vel_scale = target_max / native_max
+
+        # Cache of loaded time slices, keyed by frame index.
+        self._slice_cache = {}
+        self._cache_max = int(cfg.get('slice_cache_size', 4))
+
+    def _native_time(self, t):
+        """Convert arena time (seconds) to a continuous native frame index in [0, n_frames-1].
+
+        When the user specifies ``frames_per_step`` (or a frames-per-episode
+        budget), we first convert seconds -> env-step count (t / env_dt),
+        then multiply by frames_per_step.  Otherwise we fall back to the
+        legacy continuous-time rescale (``time_scale`` native seconds per
+        sim second).
+        """
+        n_frames = len(self._t_native)
+        if n_frames <= 1:
+            return 0.0
+
+        if self._frames_per_step is not None:
+            step_count = t / max(self._env_dt, 1e-12)
+            frac_idx = step_count * self._frames_per_step
+        else:
+            native_t = t * self.time_scale
+            frac_idx = native_t / (self._t_span / (n_frames - 1))
+
+        frac_idx = frac_idx % (n_frames - 1) if (n_frames - 1) > 0 else 0.0
+        return frac_idx
+
+    def _arena_to_native_xy(self, x, y):
+        """Map arena (x,y) -> native (x,y) with periodic wrap.
+
+        ``n_tiles`` controls how many copies of the native periodic box tile
+        across the arena.  n_tiles=1 stretches one copy across the arena
+        (biggest eddies); n_tiles=4 packs 4x4 copies into the arena (eddies
+        appear 4x smaller).
+        """
+        fx = (np.asarray(x) - self.x_range[0]) / self._Lx_arena * self._n_tiles
+        fy = (np.asarray(y) - self.y_range[0]) / self._Ly_arena * self._n_tiles
+        # Wrap periodically so out-of-arena queries still return a valid flow.
+        fx = fx - np.floor(fx)
+        fy = fy - np.floor(fy)
+        nx = self._x_native_min + fx * self._Lx_native
+        ny = self._y_native_min + fy * self._Ly_native
+        return nx, ny
+
+    def _get_slice(self, idx):
+        """Load u/v arrays for frame idx (periodic in T), cached."""
+        n_t = len(self._t_native)
+        idx = int(idx) % n_t
+        if idx in self._slice_cache:
+            return self._slice_cache[idx]
+        u = self._ds['u'].isel(time=idx).values.astype(np.float64)
+        v = self._ds['v'].isel(time=idx).values.astype(np.float64)
+        if len(self._slice_cache) >= self._cache_max:
+            self._slice_cache.pop(next(iter(self._slice_cache)))
+        self._slice_cache[idx] = (u, v)
+        return u, v
+
+    def _interp_frame(self, u_frame, v_frame, nx_pts, ny_pts):
+        """Bilinear interpolation of one (u,v) snapshot at native coords."""
+        # Fractional grid index along each axis (native grid is uniform).
+        ix = (nx_pts - self._x_native_min) / self._dx_native
+        iy = (ny_pts - self._y_native_min) / self._dy_native
+        # Periodic wrap on the integer indices.
+        i0 = np.floor(ix).astype(np.int64) % self._nx
+        j0 = np.floor(iy).astype(np.int64) % self._ny
+        i1 = (i0 + 1) % self._nx
+        j1 = (j0 + 1) % self._ny
+        fx = ix - np.floor(ix)
+        fy = iy - np.floor(iy)
+        # Bilinear.
+        def _bi(arr):
+            a00 = arr[i0, j0]
+            a10 = arr[i1, j0]
+            a01 = arr[i0, j1]
+            a11 = arr[i1, j1]
+            return ((1 - fx) * (1 - fy) * a00 + fx * (1 - fy) * a10
+                    + (1 - fx) * fy * a01 + fx * fy * a11)
+        return _bi(u_frame), _bi(v_frame)
+
+    def get_flow(self, x, y, t=0.0):
+        """Return (vx, vy) at arena position (x, y) and arena time t."""
+        nx_pt, ny_pt = self._arena_to_native_xy(x, y)
+        frac_idx = self._native_time(t)
+        i0 = int(np.floor(frac_idx))
+        i1 = i0 + 1
+        alpha = frac_idx - i0
+
+        u0, v0 = self._get_slice(i0)
+        u_a, v_a = self._interp_frame(u0, v0, np.atleast_1d(nx_pt), np.atleast_1d(ny_pt))
+        if alpha > 1e-9:
+            u1, v1 = self._get_slice(i1)
+            u_b, v_b = self._interp_frame(u1, v1, np.atleast_1d(nx_pt), np.atleast_1d(ny_pt))
+            vx_n = (1 - alpha) * u_a + alpha * u_b
+            vy_n = (1 - alpha) * v_a + alpha * v_b
+        else:
+            vx_n = u_a
+            vy_n = v_a
+        vx = float(vx_n.ravel()[0]) * self._vel_scale
+        vy = float(vy_n.ravel()[0]) * self._vel_scale
+        return vx, vy
+
+    def get_flow_grid(self, xs, ys, t=0.0):
+        """Return (vx, vy) on a meshgrid at arena time t (ij indexing)."""
+        xs = np.asarray(xs)
+        ys = np.asarray(ys)
+        yy, xx = np.meshgrid(ys, xs, indexing='ij')
+        nx_pts, ny_pts = self._arena_to_native_xy(xx, yy)
+
+        frac_idx = self._native_time(t)
+        i0 = int(np.floor(frac_idx))
+        i1 = i0 + 1
+        alpha = frac_idx - i0
+
+        u0, v0 = self._get_slice(i0)
+        u_a, v_a = self._interp_frame(u0, v0, nx_pts, ny_pts)
+        if alpha > 1e-9:
+            u1, v1 = self._get_slice(i1)
+            u_b, v_b = self._interp_frame(u1, v1, nx_pts, ny_pts)
+            vx = (1 - alpha) * u_a + alpha * u_b
+            vy = (1 - alpha) * v_a + alpha * v_b
+        else:
+            vx = u_a
+            vy = v_a
+        return vx * self._vel_scale, vy * self._vel_scale
+
 
 
 def _make_grid(x_range=(-4.0, 24.0), y_range=(-4.0, 24.0), n=256):
