@@ -27,7 +27,10 @@ All parameters are controlled by a single YAML config file (zermelo_config.yaml)
 
 Usage:
     python scripts/generate_dataset.py
+    python scripts/generate_dataset.py --num_workers=16
+
 """
+import multiprocessing as mp
 import pathlib
 from collections import defaultdict
 
@@ -42,6 +45,8 @@ from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 FLAGS = flags.FLAGS
 
 flags.DEFINE_string('config', None, 'Path to zermelo_config.yaml (optional; uses built-in defaults if omitted).')
+flags.DEFINE_integer('num_workers', 16,
+                     'Number of parallel worker processes. 1 = run serially in-process.')
 
 
 def bfs_reachable(maze_map, start_ij):
@@ -184,43 +189,163 @@ class AgentPersonality:
         return np.clip(action, -1, 1)
 
 
-def main(_):
-    cfg = load_config(FLAGS.config)
-
-    # Unpack sections for readability.
-    ds_cfg = cfg['dataset']
-    traj_cfg = cfg['trajectory']
-    pers_cfg = cfg['personality']
-    sg_cfg = cfg['start_goal']
-    reward_cfg = cfg['reward']
-
-    np.random.seed(ds_cfg['seed'])
-
-    # Build env kwargs from config.
-    env_kwargs = config_to_env_kwargs(cfg)
-    env_kwargs['max_episode_steps'] = ds_cfg['max_episode_steps']
-
-    env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
-
-    # Collect free cells and pre-compute BFS cache.
-    all_cells = []
-    maze_map = env.unwrapped.maze_map
-    for i in range(maze_map.shape[0]):
-        for j in range(maze_map.shape[1]):
-            if maze_map[i, j] == 0:
-                all_cells.append((i, j))
-
+def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg,
+                     traj_cfg, pers_cfg, reward_cfg):
+    """Run a single episode and return the per-step data plus episode summary stats."""
     maze_enabled = cfg['maze']['enabled']
+    fixed_init_ij = tuple(sg_cfg['start_ij'])
+    fixed_goal_ij = tuple(sg_cfg['goal_ij'])
 
     if maze_enabled:
-        print(f'Pre-computing BFS cache for {len(all_cells)} free cells...')
-        bfs_cache = precompute_bfs_cache(maze_map, all_cells)
         xy_to_ij = env.unwrapped.xy_to_ij
         ij_to_xy = env.unwrapped.ij_to_xy
 
-    # Compute continuous XY bounds for open-arena waypoint sampling.
+    # Choose start and goal for this episode.
+    if sg_cfg['fixed']:
+        init_ij = fixed_init_ij
+        goal_ij = fixed_goal_ij
+    else:
+        init_ij = all_cells[np.random.randint(len(all_cells))]
+        goal_ij = all_cells[np.random.randint(len(all_cells))]
+        while goal_ij == init_ij:
+            goal_ij = all_cells[np.random.randint(len(all_cells))]
+
+    # Sample intermediate waypoints to force diverse routes.
+    if maze_enabled:
+        waypoints_ij = sample_reachable_waypoints(
+            maze_map, all_cells, init_ij, goal_ij,
+            traj_cfg['max_waypoints'], traj_cfg['max_detour'], bfs_cache,
+        )
+        route_ij = waypoints_ij + [goal_ij]
+        route_xy = [np.array(env.unwrapped.ij_to_xy(ij)) for ij in route_ij]
+    else:
+        start_xy = np.array(env.unwrapped.ij_to_xy(init_ij))
+        goal_xy = np.array(env.unwrapped.ij_to_xy(goal_ij))
+        waypoints_xy = sample_xy_waypoints(
+            start_xy, goal_xy, xy_bounds,
+            traj_cfg['max_waypoints'], traj_cfg['max_detour'],
+        )
+        route_xy = [np.array(wp) for wp in waypoints_xy] + [goal_xy]
+
+    route_idx = 0
+    current_target_xy = route_xy[route_idx]
+
+    personality = AgentPersonality(
+        noise_range=pers_cfg['noise'],
+        inertia_range=pers_cfg['inertia'],
+        speed_range=pers_cfg['speed'],
+    )
+
+    ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
+
+    ep_data = defaultdict(list)
+    done = False
+    step = 0
+    ep_anorms = []
+    ep_dists = []
+    ep_goal_r = 0.0
+    ep_energy_r = 0.0
+    ep_time_r = 0.0
+    ep_dist_r = 0.0
+    wp_tol = traj_cfg['waypoint_tolerance']
+    wp_timeout = traj_cfg.get('waypoint_timeout', 200)
+    wp_steps = 0
+
+    info = {}
+    while not done:
+        agent_xy = env.unwrapped.get_xy()
+
+        dist_to_waypoint = np.linalg.norm(agent_xy - current_target_xy)
+        wp_steps += 1
+
+        timed_out = wp_steps >= wp_timeout and route_idx < len(route_xy) - 1
+        reached = dist_to_waypoint < wp_tol and route_idx < len(route_xy) - 1
+
+        if reached or timed_out:
+            route_idx += 1
+            current_target_xy = route_xy[route_idx]
+            wp_steps = 0
+
+        if maze_enabled:
+            target_ij = xy_to_ij(current_target_xy)
+            subgoal_xy = oracle_subgoal_from_cache(
+                agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy)
+        else:
+            subgoal_xy = current_target_xy
+        subgoal_dir = subgoal_xy - agent_xy
+        norm = np.linalg.norm(subgoal_dir)
+        if norm > 1e-6:
+            subgoal_dir = subgoal_dir / norm
+
+        action = personality.get_action(subgoal_dir)
+
+        next_ob, reward, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+
+        ep_anorms.append(np.linalg.norm(action))
+
+        step_goal_r = info.get('success', 0.0) * reward_cfg['goal_reward']
+        step_energy_r = info.get('energy_cost', 0.0)
+        step_time_r = -reward_cfg['time_weight']
+        step_dist = info.get('dist_to_goal', 0.0)
+        step_dist_r = -reward_cfg['distance_weight'] * step_dist
+        ep_goal_r += step_goal_r
+        ep_energy_r += step_energy_r
+        ep_time_r += step_time_r
+        ep_dist_r += step_dist_r
+        ep_dists.append(step_dist)
+
+        ep_data['observations'].append(ob)
+        ep_data['next_observations'].append(next_ob)
+        ep_data['actions'].append(action)
+        ep_data['rewards'].append(reward)
+        ep_data['terminals'].append(float(done))
+        ep_data['masks'].append(0.0 if terminated else 1.0)
+        ep_data['qpos'].append(info['prev_qpos'])
+        ep_data['qvel'].append(info['prev_qvel'])
+        ep_data['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
+        ep_data['dist_to_goal'].append(step_dist)
+        ep_data['goal_reward_components'].append(step_goal_r)
+        ep_data['energy_reward_components'].append(step_energy_r)
+        ep_data['time_reward_components'].append(step_time_r)
+        ep_data['distance_reward_components'].append(step_dist_r)
+
+        ob = next_ob
+        step += 1
+
+    stats = dict(
+        length=step,
+        action_norm=float(np.mean(ep_anorms)) if ep_anorms else 0.0,
+        success=info.get('success', 0.0),
+        goal_r=ep_goal_r,
+        energy_r=ep_energy_r,
+        time_r=ep_time_r,
+        dist_r=ep_dist_r,
+        dist_sum=float(np.sum(ep_dists)),
+    )
+    return ep_data, stats
+
+
+def _build_env_and_caches(cfg):
+    """Build env + per-worker BFS cache / xy bounds. Returned as a dict."""
+    ds_cfg = cfg['dataset']
+    env_kwargs = config_to_env_kwargs(cfg)
+    env_kwargs['max_episode_steps'] = ds_cfg['max_episode_steps']
+    env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
+
+    maze_map = env.unwrapped.maze_map
+    all_cells = [
+        (i, j)
+        for i in range(maze_map.shape[0])
+        for j in range(maze_map.shape[1])
+        if maze_map[i, j] == 0
+    ]
+
+    maze_enabled = cfg['maze']['enabled']
+    bfs_cache = precompute_bfs_cache(maze_map, all_cells) if maze_enabled else None
+
+    xy_bounds = None
     if not maze_enabled:
-        # Inner free cells are rows/cols 1..6 in an 8x8 grid.
         corner_min = np.array(env.unwrapped.ij_to_xy((1, 1)))
         corner_max = np.array(env.unwrapped.ij_to_xy((6, 6)))
         xy_bounds = (min(corner_min[0], corner_max[0]),
@@ -228,160 +353,88 @@ def main(_):
                      min(corner_min[1], corner_max[1]),
                      max(corner_min[1], corner_max[1]))
 
+    return dict(env=env, maze_map=maze_map, all_cells=all_cells,
+                bfs_cache=bfs_cache, xy_bounds=xy_bounds)
+
+
+def _worker_main(args):
+    """Run a chunk of episodes in a worker process and return the collected data."""
+    cfg, seed, n_episodes, worker_id = args
+    np.random.seed(seed)
+
+    ctx = _build_env_and_caches(cfg)
+    sg_cfg = cfg['start_goal']
+    traj_cfg = cfg['trajectory']
+    pers_cfg = cfg['personality']
+    reward_cfg = cfg['reward']
+
     dataset = defaultdict(list)
-    # Per-episode reward breakdown accumulators (for stats only, not saved to npz)
-    ep_goal_rewards = []
-    ep_energy_costs = []
-    ep_time_costs = []
-    ep_dist_costs = []
-    ep_dist_sums = []
-    total_steps = 0
+    all_stats = []
+    iterator = trange(n_episodes, position=worker_id, desc=f'worker {worker_id}') \
+        if worker_id == 0 else range(n_episodes)
+    for _ in iterator:
+        ep_data, stats = _run_one_episode(
+            ctx['env'], cfg, ctx['maze_map'], ctx['all_cells'], ctx['bfs_cache'],
+            ctx['xy_bounds'], sg_cfg, traj_cfg, pers_cfg, reward_cfg,
+        )
+        for k, v in ep_data.items():
+            dataset[k].extend(v)
+        all_stats.append(stats)
+
+    ctx['env'].close()
+    return dict(dataset), all_stats
+
+
+def main(_):
+    cfg = load_config(FLAGS.config)
+
+    ds_cfg = cfg['dataset']
+    reward_cfg = cfg['reward']
     num_episodes = ds_cfg['num_episodes']
 
-    # Per-episode stats for reward parameter tuning.
-    ep_lengths = []
-    ep_action_norms = []
-    ep_successes = []
+    n_workers = min(FLAGS.num_workers, num_episodes)
 
-    # Fixed start/goal from config.
-    fixed_init_ij = tuple(sg_cfg['start_ij'])
-    fixed_goal_ij = tuple(sg_cfg['goal_ij'])
+    # Split episodes across workers as evenly as possible.
+    per_worker = [num_episodes // n_workers] * n_workers
+    for i in range(num_episodes % n_workers):
+        per_worker[i] += 1
 
-    for ep_idx in trange(num_episodes):
+    base_seed = ds_cfg['seed']
+    worker_args = [
+        (cfg, base_seed + 1000 * wid, per_worker[wid], wid)
+        for wid in range(n_workers)
+    ]
 
-        # Choose start and goal for this episode.
-        if sg_cfg['fixed']:
-            init_ij = fixed_init_ij
-            goal_ij = fixed_goal_ij
-        else:
-            init_ij = all_cells[np.random.randint(len(all_cells))]
-            goal_ij = all_cells[np.random.randint(len(all_cells))]
-            # Ensure start != goal.
-            while goal_ij == init_ij:
-                goal_ij = all_cells[np.random.randint(len(all_cells))]
+    print(f'Generating {num_episodes} episodes across {n_workers} worker(s)...')
+    if cfg['maze']['enabled']:
+        # Each worker will build its own BFS cache; report once.
+        print('(each worker will precompute its own BFS cache at startup)')
 
-        # Sample intermediate waypoints to force diverse routes.
-        if maze_enabled:
-            waypoints_ij = sample_reachable_waypoints(
-                maze_map, all_cells, init_ij, goal_ij,
-                traj_cfg['max_waypoints'], traj_cfg['max_detour'], bfs_cache,
-            )
-            # Full route as grid cells: start -> waypoints -> goal.
-            route_ij = waypoints_ij + [goal_ij]
-            route_xy = [np.array(env.unwrapped.ij_to_xy(ij)) for ij in route_ij]
-        else:
-            start_xy = np.array(env.unwrapped.ij_to_xy(init_ij))
-            goal_xy = np.array(env.unwrapped.ij_to_xy(goal_ij))
-            waypoints_xy = sample_xy_waypoints(
-                start_xy, goal_xy, xy_bounds,
-                traj_cfg['max_waypoints'], traj_cfg['max_detour'],
-            )
-            route_xy = [np.array(wp) for wp in waypoints_xy] + [goal_xy]
+    if n_workers == 1:
+        results = [_worker_main(worker_args[0])]
+    else:
+        # spawn avoids MuJoCo fork-safety issues.
+        mp_ctx = mp.get_context('spawn')
+        with mp_ctx.Pool(n_workers) as pool:
+            results = pool.map(_worker_main, worker_args)
 
-        route_idx = 0
-        current_target_xy = route_xy[route_idx]
+    # Merge per-worker datasets and stats.
+    dataset = defaultdict(list)
+    stats_list = []
+    for worker_dataset, worker_stats in results:
+        for k, v in worker_dataset.items():
+            dataset[k].extend(v)
+        stats_list.extend(worker_stats)
 
-        # Each episode gets a fresh agent personality.
-        personality = AgentPersonality(
-            noise_range=pers_cfg['noise'],
-            inertia_range=pers_cfg['inertia'],
-            speed_range=pers_cfg['speed'],
-        )
-
-        ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
-        # Ensure the env's goal matches what reset() chose (don't re-noise).
-        # reset() already set cur_goal_xy with noise; just keep it.
-
-        done = False
-        step = 0
-        ep_anorms = []
-        ep_dists = []
-        ep_goal_r = 0.0
-        ep_energy_r = 0.0
-        ep_time_r = 0.0
-        ep_dist_r = 0.0
-        wp_tol = traj_cfg['waypoint_tolerance']
-        wp_timeout = traj_cfg.get('waypoint_timeout', 200)
-        wp_steps = 0  # steps spent pursuing the current waypoint
-
-        while not done:
-            agent_xy = env.unwrapped.get_xy()
-
-            # Check if we've reached the current waypoint, or timed out on it.
-            dist_to_waypoint = np.linalg.norm(agent_xy - current_target_xy)
-            wp_steps += 1
-
-            timed_out = wp_steps >= wp_timeout and route_idx < len(route_xy) - 1
-            reached = dist_to_waypoint < wp_tol and route_idx < len(route_xy) - 1
-
-            if reached or timed_out:
-                route_idx += 1
-                current_target_xy = route_xy[route_idx]
-                wp_steps = 0
-
-            # Get direction toward the current target.
-            if maze_enabled:
-                target_ij = xy_to_ij(current_target_xy)
-                subgoal_xy = oracle_subgoal_from_cache(
-                    agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy)
-            else:
-                # Open arena: steer directly toward the target.
-                subgoal_xy = current_target_xy
-            subgoal_dir = subgoal_xy - agent_xy
-            norm = np.linalg.norm(subgoal_dir)
-            if norm > 1e-6:
-                subgoal_dir = subgoal_dir / norm
-
-            # Let the personality produce the actual action.
-            action = personality.get_action(subgoal_dir)
-
-            next_ob, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-
-            ep_anorms.append(np.linalg.norm(action))
-
-            # Reward components (already computed in info by the env).
-            step_goal_r = info.get('success', 0.0) * reward_cfg['goal_reward']
-            step_energy_r = info.get('energy_cost', 0.0)  # already negative
-            step_time_r = -reward_cfg['time_weight']
-            step_dist = info.get('dist_to_goal', 0.0)
-            step_dist_r = -reward_cfg['distance_weight'] * step_dist
-            ep_goal_r += step_goal_r
-            ep_energy_r += step_energy_r
-            ep_time_r += step_time_r
-            ep_dist_r += step_dist_r
-            ep_dists.append(step_dist)
-
-            dataset['observations'].append(ob)
-            dataset['next_observations'].append(next_ob)
-            dataset['actions'].append(action)
-            dataset['rewards'].append(reward)
-            dataset['terminals'].append(float(done))
-            # masks: 0.0 if truly terminated (goal reached), 1.0 if truncated (max steps).
-            # This tells the RL algorithm whether to bootstrap from the next state.
-            dataset['masks'].append(0.0 if terminated else 1.0)
-            dataset['qpos'].append(info['prev_qpos'])
-            dataset['qvel'].append(info['prev_qvel'])
-            dataset['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
-            dataset['dist_to_goal'].append(step_dist)
-            dataset['goal_reward_components'].append(step_goal_r)
-            dataset['energy_reward_components'].append(step_energy_r)
-            dataset['time_reward_components'].append(step_time_r)
-            dataset['distance_reward_components'].append(step_dist_r)
-
-            ob = next_ob
-            step += 1
-
-        ep_lengths.append(step)
-        ep_action_norms.append(np.mean(ep_anorms))
-        ep_successes.append(info.get('success', 0.0))
-        ep_goal_rewards.append(ep_goal_r)
-        ep_energy_costs.append(ep_energy_r)
-        ep_time_costs.append(ep_time_r)
-        ep_dist_costs.append(ep_dist_r)
-        ep_dist_sums.append(np.sum(ep_dists))
-
-        total_steps += step
+    ep_lengths = [s['length'] for s in stats_list]
+    ep_action_norms = [s['action_norm'] for s in stats_list]
+    ep_successes = [s['success'] for s in stats_list]
+    ep_goal_rewards = [s['goal_r'] for s in stats_list]
+    ep_energy_costs = [s['energy_r'] for s in stats_list]
+    ep_time_costs = [s['time_r'] for s in stats_list]
+    ep_dist_costs = [s['dist_r'] for s in stats_list]
+    ep_dist_sums = [s['dist_sum'] for s in stats_list]
+    total_steps = sum(ep_lengths)
 
     # --- Dataset stats for reward parameter tuning ---
     ep_lengths = np.array(ep_lengths)
