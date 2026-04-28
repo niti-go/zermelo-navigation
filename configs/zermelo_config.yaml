@@ -39,32 +39,58 @@ maze:
 #   2. Dynamic: dynamic.enabled = true   →  uses analytic time-varying TGV
 #      (field_path is completely ignored)
 flow:
-  field_path: zermelo_env/assets/taylor_green_field.npz
+  field_path: datasets/HIT2.nc
   # set to null for built-in default (yellow_path_field.npz)
+  # other options:
+  # - zermelo_env/assets/taylor_green_field.npz
+  # - datasets/HIT2.nc
+
   # create a custom flow field using: python zermelo_env/zermelo_flow.py --name taylor_green
 
   # --- Dynamic (time-varying) flow ------------------------------------------
-  # When enabled, the environment computes an analytic time-varying TGV
-  # at every step. field_path is completely ignored.
+  # When enabled, the environment computes a spatiotemporal flow field at
+  # every step. field_path is completely ignored.
   #
-  # Three temporal effects (mix and match — set to 0 to disable any):
-  #   decay:       exp(-nu*(kx^2+ky^2) * t)  viscous dissipation (NS analytical)
-  #   oscillation: cos(omega * t)             periodic reversal (custom extension)
-  #   translation: vortex pattern drifts at constant velocity (Ux, Uy)
+  # Two modes:
+  #   mode: tgv     — analytic Taylor-Green vortex (NS-exact with decay).
+  #   mode: netcdf  — load (u,v,time,x,y) from a NetCDF (.nc) file, e.g. a
+  #                   pre-computed DNS/HIT turbulence snapshot.
   dynamic:
-    enabled: true                    # flip to true for spatiotemporal TGV
+    enabled: true                    # flip to true for spatiotemporal flow
+    mode: netcdf                     # "tgv" or "netcdf"
+
+    # -- TGV params (only used when mode: tgv) ------------------------------
     amplitude: 1.8                   # peak velocity magnitude at t=0
-    nu: 0.2                         # viscosity (decay rate); 0 = no decay
+    nu: 0.2                          # viscosity (decay rate); 0 = no decay
     omega: 0.0                       # oscillation frequency (rad/s); 0 = no oscillation
     Ux: 0.0                          # vortex pattern drift speed in x; 0 = stationary
     Uy: 0.0                          # vortex pattern drift speed in y; 0 = stationary
     n_vortices: 2                    # number of full vortex wavelengths per dim
-    x_range: [-4.0, 24.0]           # spatial domain (should match arena)
-    y_range: [-4.0, 24.0]
 
     #If you set omega, Ux, and Uy to nonzero values,
     # it is no longer valid TGV flow (solutions to Navier-Stokes)
 
+    # -- NetCDF params (only used when mode: netcdf) ------------------------
+    netcdf:
+      # Point to a folder of .nc files (chained along time in numeric-suffix
+      # order — HIT1.nc, HIT2.nc, ..., HIT9.nc). All files must share the
+      # same (x, y) grid. Alternatively set `nc_paths: [...]` for an explicit
+      # ordered list, or `nc_path: path.nc` for a single file.
+      nc_dir: datasets/hit_flow      # relative to repo root
+      # How fast the dataset plays.  Set ONE of these (frames_per_step wins):
+      frames_per_step: 3          # HIT snapshots advanced per env step
+      #frames_per_episode: 9000      # alt: snapshots per episode (÷ max_episode_steps)
+      target_max: 2.7                # rescale velocities to this peak magnitude
+      #The agent-overcome threshold is 2*sqrt(2) ≈ 2.828
+      slice_cache_size: 4            # how many (T,X,Y) frames to keep in RAM
+      n_tiles: 1.0                   # how many native-box copies tile the arena.
+                                     # 1 = one big copy (largest eddies);
+                                     # 2 = 2x2 tiling (eddies 2x smaller); etc.
+                                     # Field stays seamless (native data is periodic).
+
+    # -- Shared domain params (both modes) ----------------------------------
+    x_range: [-4.0, 24.0]            # arena spatial domain (should match arena)
+    y_range: [-4.0, 24.0]
     #Also, x_range and y_range must be equal for divergence = 0
 
 # --- Start / goal -----------------------------------------------------------
@@ -76,12 +102,12 @@ start_goal:
 # --- Reward -----------------------------------------------------------------
 reward:
   goal_reward: 100.0                # sparse reward on reaching the goal
-  energy_weight: 0.00805            # penalty per unit of action magnitude per step
-  time_weight: 0.09455               # constant per-step penalty
-  distance_weight: 0.01529           # per-step penalty proportional to distance from goal
+  energy_weight: 0.08           # penalty per unit of action magnitude per step
+  time_weight: 0.12               # constant per-step penalty
+  distance_weight: 0.009         # per-step penalty proportional to distance from goal
   # The drift threshold is just an informational logging feature, it doesn't affect the reward or dynamics at all.
   # It helps visualize what fraction of a trajectory involves active control vs passive drift
-  drift_threshold: 0.01           # action norm below this counts as "drifting".
+  drift_threshold: 0.0           # action norm below this counts as "drifting".
   
 
 # --- Observation ------------------------------------------------------------
@@ -94,14 +120,16 @@ env:
   terminate_at_goal: true         # end the episode when goal is reached
   goal_tolerance: 1.0             # xy-distance to count as "reached"
   add_noise_to_goal: true         # jitter goal position slightly each reset
+  add_noise_to_start: true        # jitter start position slightly each reset
   success_timing: post            # compute success "pre" or "post" action
+  show_action_arrow: true         # draw an arrow on the agent showing the last action (length ∝ |action|)
 
 # --- Dataset generation -----------------------------------------------------
 dataset:
   seed: 0
-  num_episodes: 30
-  max_episode_steps: 1001
-  save_path: datasets/zermelo_dynamic_30.npz #run this from the repo root
+  num_episodes: 20000
+  max_episode_steps: 1000
+  save_path: datasets/zermelo_new_hit_20000.npz #run this from the repo root
 
 # --- Trajectory diversity (data generation only) ----------------------------
 trajectory:

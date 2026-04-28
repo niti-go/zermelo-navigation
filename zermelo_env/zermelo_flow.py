@@ -1,4 +1,6 @@
+import glob
 import os
+import re
 
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -135,12 +137,57 @@ class DynamicTGVFlowField:
         return vx, vy
 
 
-class DynamicNetCDFFlowField:
-    """Time-varying 2D flow field loaded from a NetCDF (.nc) file.
+def _resolve_nc_paths(nc_dir=None, nc_paths=None, nc_path=None):
+    """Resolve the netcdf config fields to an ordered list of absolute paths.
 
-    Expects a dataset with variables ``u(time, x, y)`` and ``v(time, x, y)``
-    and 1-D coords ``time``, ``x``, ``y`` (e.g. the Diff-FlowFSI HIT datasets:
-    T=800 snapshots on a 512x512 periodic box with x,y in [0, 2pi]).
+    Exactly one of ``nc_dir`` / ``nc_paths`` / ``nc_path`` should be set.
+    When ``nc_dir`` is used, files are sorted by the integer found in the
+    filename (HIT1, HIT2, ..., HIT9, HIT10 — not lexicographic).
+    """
+    if nc_dir is not None:
+        if not os.path.isabs(nc_dir):
+            nc_dir = os.path.abspath(nc_dir)
+        if not os.path.isdir(nc_dir):
+            raise ValueError(f'dynamic.netcdf.nc_dir does not exist: {nc_dir}')
+        files = glob.glob(os.path.join(nc_dir, '*.nc'))
+        if not files:
+            raise ValueError(f'No .nc files found in {nc_dir}')
+
+        def _num_key(p):
+            m = re.search(r'(\d+)', os.path.basename(p))
+            return (int(m.group(1)) if m else 0, os.path.basename(p))
+
+        return sorted(files, key=_num_key)
+
+    if nc_paths is not None:
+        if isinstance(nc_paths, str):
+            nc_paths = [nc_paths]
+        return [p if os.path.isabs(p) else os.path.abspath(p) for p in nc_paths]
+
+    if nc_path is not None:
+        return [nc_path if os.path.isabs(nc_path) else os.path.abspath(nc_path)]
+
+    raise ValueError(
+        'dynamic.netcdf must set one of nc_dir, nc_paths, or nc_path '
+        'when using netcdf flow mode.'
+    )
+
+
+class DynamicNetCDFFlowField:
+    """Time-varying 2D flow field loaded from one or more NetCDF (.nc) files.
+
+    Expects each dataset to have variables ``u(time, x, y)`` and
+    ``v(time, x, y)`` and 1-D coords ``time``, ``x``, ``y`` (e.g. the
+    Diff-FlowFSI HIT datasets: 1000 snapshots per file on a 512x512 periodic
+    box with x,y in [0, 2pi]).
+
+    Multiple files are concatenated along time into one long virtual clip;
+    all files must share the same spatial grid.  You can point to:
+      - ``nc_dir``: a directory — every ``*.nc`` inside is sorted by the
+        integer suffix in the filename (e.g. ``HIT1.nc``, ``HIT2.nc``, …) and
+        chained in that order;
+      - ``nc_paths``: an explicit ordered list of files;
+      - ``nc_path``: a single file (back-compat shorthand).
 
     The simulation's native domain is remapped to the Zermelo arena
     ``(x_range, y_range)`` via an affine rescale, with periodic wrap by
@@ -150,8 +197,8 @@ class DynamicNetCDFFlowField:
     snapshots the flow advances per env step.  If ``frames_per_step`` is not
     given but ``frames_per_episode`` + ``max_episode_steps`` are, they're
     used to derive it (so one playthrough = frames_per_episode frames over
-    max_episode_steps steps).  ``loop_time`` controls what happens past the
-    last frame (wrap vs. clamp).
+    max_episode_steps steps).  Time wraps back to frame 0 after the last
+    frame of the last file.
 
     The velocities are also rescaled to ``target_max`` (default 1.8) so they
     match the magnitude regime the agent expects (agent step = 0.2, flow
@@ -165,21 +212,43 @@ class DynamicNetCDFFlowField:
                 'pip install xarray netCDF4'
             )
 
-        nc_path = cfg.get('nc_path')
-        if nc_path is None:
-            raise ValueError('dynamic.netcdf.nc_path must be set when using netcdf flow mode.')
-        if not os.path.isabs(nc_path):
-            nc_path = os.path.abspath(nc_path)
+        nc_paths = _resolve_nc_paths(
+            nc_dir=cfg.get('nc_dir'),
+            nc_paths=cfg.get('nc_paths'),
+            nc_path=cfg.get('nc_path'),
+        )
 
-        # Lazy-open (don't load the whole 3.2 GB file into memory).
-        self._ds = _xr.open_dataset(nc_path)
-        if 'u' not in self._ds or 'v' not in self._ds:
-            raise ValueError(f"NetCDF file {nc_path} must contain 'u' and 'v' variables.")
+        # Lazy-open every file; verify they share the same spatial grid.
+        self._datasets = [_xr.open_dataset(p) for p in nc_paths]
+        for p, ds in zip(nc_paths, self._datasets):
+            if 'u' not in ds or 'v' not in ds:
+                raise ValueError(f"NetCDF file {p} must contain 'u' and 'v' variables.")
 
-        # Native coordinates.
-        self._t_native = np.asarray(self._ds['time'].values, dtype=np.float64)
-        self._x_native = np.asarray(self._ds['x'].values, dtype=np.float64)
-        self._y_native = np.asarray(self._ds['y'].values, dtype=np.float64)
+        ref_x = np.asarray(self._datasets[0]['x'].values, dtype=np.float64)
+        ref_y = np.asarray(self._datasets[0]['y'].values, dtype=np.float64)
+        for p, ds in zip(nc_paths[1:], self._datasets[1:]):
+            x = np.asarray(ds['x'].values, dtype=np.float64)
+            y = np.asarray(ds['y'].values, dtype=np.float64)
+            if x.shape != ref_x.shape or y.shape != ref_y.shape \
+                    or not np.allclose(x, ref_x) or not np.allclose(y, ref_y):
+                raise ValueError(
+                    f'NetCDF file {p} has a different spatial grid than {nc_paths[0]}; '
+                    'all files must share the same (x, y) grid.'
+                )
+
+        # Per-file frame counts and cumulative offsets for frame-index -> file routing.
+        self._frames_per_file = np.array(
+            [ds.sizes['time'] for ds in self._datasets], dtype=np.int64
+        )
+        self._file_offsets = np.concatenate(([0], np.cumsum(self._frames_per_file)))
+        self._n_frames_total = int(self._file_offsets[-1])
+
+        # Native coordinates (time is the concatenation of each file's time axis).
+        self._t_native = np.concatenate(
+            [np.asarray(ds['time'].values, dtype=np.float64) for ds in self._datasets]
+        )
+        self._x_native = ref_x
+        self._y_native = ref_y
 
         self._t0 = float(self._t_native[0])
         self._t_span = float(self._t_native[-1] - self._t_native[0])
@@ -234,28 +303,32 @@ class DynamicNetCDFFlowField:
         self._env_dt = float(cfg.get('env_dt', 0.1))
 
         # Velocity normalization so magnitudes match the static-field regime.
-        # Uses the global max across all frames (not just frame 0) so no frame
-        # in the dataset exceeds target_max after scaling.
+        # Uses the first frame of the first file as a proxy for the global max
+        # (HIT is statistically stationary, so frame 0 is representative).
+        # Individual frames may occasionally exceed target_max after scaling.
         target_max = float(cfg.get('target_max', MAX_FLOW_MAGNITUDE))
-        u_max = float(np.max(np.abs(self._ds['u'].values)))
-        v_max = float(np.max(np.abs(self._ds['v'].values)))
-        native_max = max(u_max, v_max, 1e-8)
+        u0 = self._datasets[0]['u'].isel(time=0).values
+        v0 = self._datasets[0]['v'].isel(time=0).values
+        native_max = max(float(np.max(np.abs(u0))), float(np.max(np.abs(v0))), 1e-8)
         self._vel_scale = target_max / native_max
 
-        # Cache of loaded time slices, keyed by frame index.
+        # Cache of loaded time slices, keyed by global frame index.
         self._slice_cache = {}
         self._cache_max = int(cfg.get('slice_cache_size', 4))
 
     def _native_time(self, t):
-        """Convert arena time (seconds) to a continuous native frame index in [0, n_frames-1].
+        """Convert arena time (seconds) to a continuous native frame index in [0, n_frames).
 
         When the user specifies ``frames_per_step`` (or a frames-per-episode
         budget), we first convert seconds -> env-step count (t / env_dt),
         then multiply by frames_per_step.  Otherwise we fall back to the
         legacy continuous-time rescale (``time_scale`` native seconds per
         sim second).
+
+        The index wraps modulo the total frame count so episodes longer than
+        the concatenated clip keep replaying it seamlessly.
         """
-        n_frames = len(self._t_native)
+        n_frames = self._n_frames_total
         if n_frames <= 1:
             return 0.0
 
@@ -266,7 +339,7 @@ class DynamicNetCDFFlowField:
             native_t = t * self.time_scale
             frac_idx = native_t / (self._t_span / (n_frames - 1))
 
-        frac_idx = frac_idx % (n_frames - 1) if (n_frames - 1) > 0 else 0.0
+        frac_idx = frac_idx % n_frames
         return frac_idx
 
     def _arena_to_native_xy(self, x, y):
@@ -287,13 +360,16 @@ class DynamicNetCDFFlowField:
         return nx, ny
 
     def _get_slice(self, idx):
-        """Load u/v arrays for frame idx (periodic in T), cached."""
-        n_t = len(self._t_native)
-        idx = int(idx) % n_t
+        """Load u/v arrays for global frame idx (periodic in T), cached."""
+        idx = int(idx) % self._n_frames_total
         if idx in self._slice_cache:
             return self._slice_cache[idx]
-        u = self._ds['u'].isel(time=idx).values.astype(np.float64)
-        v = self._ds['v'].isel(time=idx).values.astype(np.float64)
+        # Route the global frame index to the right file + local index.
+        file_i = int(np.searchsorted(self._file_offsets, idx, side='right') - 1)
+        local_idx = idx - int(self._file_offsets[file_i])
+        ds = self._datasets[file_i]
+        u = ds['u'].isel(time=local_idx).values.astype(np.float64)
+        v = ds['v'].isel(time=local_idx).values.astype(np.float64)
         if len(self._slice_cache) >= self._cache_max:
             self._slice_cache.pop(next(iter(self._slice_cache)))
         self._slice_cache[idx] = (u, v)

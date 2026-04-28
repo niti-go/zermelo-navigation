@@ -35,17 +35,18 @@ _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, _repo_root)
 import zermelo_env  # noqa — registers gymnasium envs
 from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
-from zermelo_env.zermelo_flow import FlowField
+from zermelo_env.zermelo_flow import DynamicNetCDFFlowField, DynamicTGVFlowField, FlowField
 
 # ── Config ───────────────────────────────────────────────────────────────────
-RESULTS_DIR = os.path.join(_repo_root, 'results', 'zermelo_offline_results')
-NUM_EVAL_EPISODES = 20
+RESULTS_DIR = os.path.join(_repo_root, 'results', 'zermelo_hit_offline_results')
+NUM_EVAL_EPISODES = 30
 VIDEO_FPS = 30
 RENDER_SIZE = 400
 
-BC_DIR = os.path.join(_repo_root, 'exp', 'zermelo', 'bc', 'bc_sd000_20260403_140851')
-DT_DIR = os.path.join(_repo_root, 'exp', 'zermelo', 'dt', 'dt_sd000_20260403_141030')
-MFQL_DIR = os.path.join(_repo_root, 'exp', 'zermelo', 'meanflowql', 'sd000_20260403_143654')
+#EDIT THIS TO FIND WANDB MODEL CHECKPOINTS
+BC_DIR = os.path.join(_repo_root, 'exp', 'zermelo_hit_dynamic', 'bc', 'bc_sd000_20260428_002531')
+DT_DIR = os.path.join(_repo_root, 'exp', 'zermelo_hit_dynamic', 'dt', 'dt_sd000_20260428_002604')
+MFQL_DIR = os.path.join(_repo_root, 'exp', 'zermelo_hit_dynamic', 'meanflowql', 'sd000_20260428_002527')
 
 ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c'}
 ALGO_ORDER = ['BC', 'DT', 'MeanFlowQL']
@@ -118,6 +119,10 @@ def make_eval_env(render_mode=None):
     cfg = load_config(None)
     env_kwargs = config_to_env_kwargs(cfg)
     env_kwargs['fixed_start_goal'] = False
+    # Eval samples fresh start/goal cells each episode; suppress within-cell
+    # jitter so both endpoints sit at their cell centers deterministically.
+    env_kwargs['add_noise_to_goal'] = False
+    env_kwargs['add_noise_to_start'] = False
     env_kwargs['max_episode_steps'] = cfg['dataset']['max_episode_steps']
     kw = {}
     if render_mode:
@@ -393,8 +398,22 @@ def stitch_episode_video(episode_frames, output_path):
 def plot_trajectories(all_results):
     """Plot 2D trajectories with flow field background."""
     cfg = load_config(None)
-    flow_path = os.path.join(_repo_root, cfg['flow']['field_path'])
-    flow = FlowField(flow_path)
+    dyn_cfg = cfg['flow'].get('dynamic', {}) or {}
+    if dyn_cfg.get('enabled', False):
+        mode = dyn_cfg.get('mode', 'tgv')
+        shared = {
+            'x_range': dyn_cfg.get('x_range', [-4.0, 24.0]),
+            'y_range': dyn_cfg.get('y_range', [-4.0, 24.0]),
+        }
+        if mode == 'netcdf':
+            flow = DynamicNetCDFFlowField({**dyn_cfg.get('netcdf', {}), **shared})
+        else:
+            flow = DynamicTGVFlowField(dyn_cfg)
+        flow_t = 0.0
+    else:
+        flow_path = os.path.join(_repo_root, cfg['flow']['field_path'])
+        flow = FlowField(flow_path)
+        flow_t = None
     maze_unit, offset = 4.0, 4.0
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -408,10 +427,13 @@ def plot_trajectories(all_results):
                     ax.add_patch(plt.Rectangle((x, y), maze_unit, maze_unit,
                                                facecolor='#cccccc', edgecolor='#999999',
                                                linewidth=0.5))
-        # Flow field
+        # Flow field (snapshot at t=0 for dynamic flows).
         xs = np.linspace(-2, 26, 25)
         ys = np.linspace(-2, 26, 25)
-        vx, vy = flow.get_flow_grid(xs, ys)
+        if flow_t is None:
+            vx, vy = flow.get_flow_grid(xs, ys)
+        else:
+            vx, vy = flow.get_flow_grid(xs, ys, t=flow_t)
         xx, yy = np.meshgrid(xs, ys)
         ax.quiver(xx, yy, vx, vy, alpha=0.12, color='gray', scale=30)
 
@@ -439,6 +461,132 @@ def plot_trajectories(all_results):
     fig.tight_layout()
     path = os.path.join(RESULTS_DIR, 'trajectories.png')
     fig.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
+def animate_trajectories(all_results, fps=30, env_dt=0.1):
+    """Animate all 3 algorithms drawing trajectories simultaneously over an
+    evolving flow field. Output: one MP4 with three side-by-side panels.
+    """
+    cfg = load_config(None)
+    dyn_cfg = cfg['flow'].get('dynamic', {}) or {}
+    if dyn_cfg.get('enabled', False):
+        mode = dyn_cfg.get('mode', 'tgv')
+        shared = {
+            'x_range': dyn_cfg.get('x_range', [-4.0, 24.0]),
+            'y_range': dyn_cfg.get('y_range', [-4.0, 24.0]),
+        }
+        if mode == 'netcdf':
+            netcdf_cfg = dict(dyn_cfg.get('netcdf', {}))
+            # The animation queries the same time index 3x per frame (one per
+            # panel); bump the cache so we don't thrash on slice loads.
+            netcdf_cfg.setdefault('slice_cache_size', 8)
+            netcdf_cfg['slice_cache_size'] = max(int(netcdf_cfg['slice_cache_size']), 8)
+            flow = DynamicNetCDFFlowField({**netcdf_cfg, **shared})
+        else:
+            flow = DynamicTGVFlowField(dyn_cfg)
+        flow_is_dynamic = True
+    else:
+        flow_path = os.path.join(_repo_root, cfg['flow']['field_path'])
+        flow = FlowField(flow_path)
+        flow_is_dynamic = False
+
+    # Pre-compute trajectories as fixed-length arrays. After an episode ends,
+    # its position stays pinned at the final point (so the "pen" stops moving
+    # but the line stays on the page).
+    max_len = max(
+        max((len(ep['trajectory']) for ep in all_results[a]), default=0)
+        for a in ALGO_ORDER
+    )
+    if max_len == 0:
+        print('  No trajectories to animate.')
+        return
+
+    padded = {a: [] for a in ALGO_ORDER}
+    for algo in ALGO_ORDER:
+        for ep in all_results[algo]:
+            traj = np.asarray(ep['trajectory'], dtype=np.float32)
+            if len(traj) == 0:
+                continue
+            pad = np.broadcast_to(traj[-1], (max_len - len(traj), 2))
+            full = np.concatenate([traj, pad], axis=0) if len(pad) else traj
+            padded[algo].append({'xy': full, 'real_len': len(traj),
+                                 'success': ep['success']})
+
+    maze_unit, offset = 4.0, 4.0
+    xs = np.linspace(-2, 26, 25)
+    ys = np.linspace(-2, 26, 25)
+    xx, yy = np.meshgrid(xs, ys)
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    quivers = []
+    line_artists = []   # list of dict per algo: {'lines': [...], 'heads': [...]}
+    for ax, algo in zip(axes, ALGO_ORDER):
+        # Boundary walls
+        for i in range(8):
+            for j in range(8):
+                if i == 0 or i == 7 or j == 0 or j == 7:
+                    x = j * maze_unit - offset - maze_unit / 2
+                    y = i * maze_unit - offset - maze_unit / 2
+                    ax.add_patch(plt.Rectangle((x, y), maze_unit, maze_unit,
+                                               facecolor='#cccccc', edgecolor='#999999',
+                                               linewidth=0.5))
+
+        # Initial flow snapshot at t=0 (gets updated each frame).
+        if flow_is_dynamic:
+            vx, vy = flow.get_flow_grid(xs, ys, t=0.0)
+        else:
+            vx, vy = flow.get_flow_grid(xs, ys)
+        q = ax.quiver(xx, yy, vx, vy, alpha=0.18, color='gray', scale=30)
+        quivers.append(q)
+
+        lines, heads = [], []
+        for ep in padded[algo]:
+            color = ALGO_COLORS[algo] if ep['success'] > 0.5 else '#d62728'
+            ls = '-' if ep['success'] > 0.5 else '--'
+            ln, = ax.plot([], [], color=color, alpha=0.45, linewidth=1.0, linestyle=ls)
+            head, = ax.plot([], [], 'o', color=color, markersize=4, alpha=0.85)
+            # Plant a marker at the start so you see the "pens" before they move.
+            ax.plot(ep['xy'][0, 0], ep['xy'][0, 1], 'o',
+                    color=color, markersize=3, alpha=0.4)
+            lines.append(ln)
+            heads.append(head)
+        line_artists.append({'lines': lines, 'heads': heads})
+
+        sr = np.mean([e['success'] for e in all_results[algo]])
+        mr = np.mean([e['return'] for e in all_results[algo]])
+        ax.set_title(f'{algo}  (success={sr:.0%}, return={mr:.1f})')
+        ax.set_xlim(-4, 24)
+        ax.set_ylim(-4, 24)
+        ax.set_aspect('equal')
+        ax.set_xlabel('x')
+        ax.set_ylabel('y')
+
+    fig.suptitle('Trajectories drawing in real time', fontsize=14, y=1.02)
+    fig.tight_layout()
+
+    path = os.path.join(RESULTS_DIR, 'trajectories.mp4')
+    print(f'  Animating {max_len} frames -> {path}')
+    with imageio.get_writer(path, fps=fps, macro_block_size=1) as writer:
+        for f in tqdm(range(max_len), desc='  frames'):
+            t = f * env_dt
+            if flow_is_dynamic:
+                vx, vy = flow.get_flow_grid(xs, ys, t=t)
+                for q in quivers:
+                    q.set_UVC(vx, vy)
+            for algo_idx, algo in enumerate(ALGO_ORDER):
+                arts = line_artists[algo_idx]
+                for ep, ln, head in zip(padded[algo], arts['lines'], arts['heads']):
+                    upto = min(f + 1, ep['real_len'])
+                    xy = ep['xy'][:upto]
+                    ln.set_data(xy[:, 0], xy[:, 1])
+                    head.set_data([ep['xy'][min(f, ep['real_len'] - 1), 0]],
+                                  [ep['xy'][min(f, ep['real_len'] - 1), 1]])
+            fig.canvas.draw()
+            frame = np.asarray(fig.canvas.buffer_rgba())[..., :3]
+            writer.append_data(frame)
+
     plt.close(fig)
     print(f'  Saved {path}')
 
@@ -551,6 +699,7 @@ def main():
     # ── Plots ──
     print('\nGenerating plots...')
     plot_trajectories(all_results)
+    animate_trajectories(all_results)
     plot_comparison(all_results)
 
     # Save results JSON

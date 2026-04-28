@@ -46,6 +46,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             success_timing='post',
             ob_type='states',
             add_noise_to_goal=True,
+            add_noise_to_start=True,
             reward_task_id=None,
             use_oracle_rep=False,
             flow_field_path=None,
@@ -63,6 +64,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             distance_weight=0.0,
             drift_threshold=0.01,
             goal_tolerance=1.0,
+            show_action_arrow=False,
             *args,
             **kwargs,
         ):
@@ -73,6 +75,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._success_timing = success_timing
             self._ob_type = ob_type
             self._add_noise_to_goal = add_noise_to_goal
+            self._add_noise_to_start = add_noise_to_start
             self._reward_task_id = reward_task_id
             self._use_oracle_rep = use_oracle_rep
             self._fixed_start_goal = fixed_start_goal
@@ -86,6 +89,8 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._time_weight = time_weight
             self._distance_weight = distance_weight
             self._drift_threshold = drift_threshold
+            self._show_action_arrow = bool(show_action_arrow)
+            self._last_action = np.zeros(2, dtype=np.float64)
 
             assert ob_type in ['states', 'pixels']
             assert success_timing in ['pre', 'post']
@@ -309,6 +314,42 @@ def make_zermelo_maze_env(*args, **kwargs):
                     conaffinity='0',
                 )
 
+            # Action-arrow geoms (size/pose updated per render). We attach them
+            # to the world body so they can be re-oriented at runtime via
+            # geom.quat (body-attached geom euler is baked at compile time).
+            # Hidden initially (size 0) — render() resizes them when there is
+            # a non-trivial last action.
+            if self._show_action_arrow:
+                # MuJoCo requires positive sizes at compile time; we hide the
+                # arrow by parking it underground until the first render() call
+                # repositions it.
+                ET.SubElement(
+                    worldbody,
+                    'geom',
+                    name='action_arrow_shaft',
+                    type='box',
+                    pos='0 0 -10',
+                    size='0.01 0.01 0.01',
+                    rgba='1.0 1.0 0.2 0.95',
+                    contype='0',
+                    conaffinity='0',
+                )
+                # Chevron arrowhead: two thin blades rotated ±135° from the
+                # shaft direction so they meet at the tip and form a `>` shape
+                # when viewed from above.
+                for side in ('l', 'r'):
+                    ET.SubElement(
+                        worldbody,
+                        'geom',
+                        name=f'action_arrow_head_{side}',
+                        type='box',
+                        pos='0 0 -10',
+                        size='0.01 0.01 0.01',
+                        rgba='1.0 0.85 0.1 1.0',
+                        contype='0',
+                        conaffinity='0',
+                    )
+
         def update_flow_arrows(self, t=0.0):
             """Update MuJoCo arrow geoms to reflect the flow field at time *t*.
 
@@ -416,7 +457,9 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             render_goal = options.get('render_goal', False)
 
-            init_xy = self.add_noise(self.ij_to_xy(self.cur_task_info['init_ij']))
+            init_xy = self.ij_to_xy(self.cur_task_info['init_ij'])
+            if self._add_noise_to_start:
+                init_xy = self.add_noise(init_xy)
             goal_xy = self.ij_to_xy(self.cur_task_info['goal_ij'])
             if self._add_noise_to_goal:
                 goal_xy = self.add_noise(goal_xy)
@@ -443,6 +486,8 @@ def make_zermelo_maze_env(*args, **kwargs):
             return ob, info
 
         def step(self, action):
+            self._last_action = np.asarray(action, dtype=np.float64).copy()
+
             if self._success_timing == 'pre':
                 success = self.compute_success()
 
@@ -486,9 +531,59 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             return ob, reward, terminated, truncated, info
 
+        def _update_action_arrow(self):
+            """Resize/orient the action arrow geom from the last action."""
+            if not self._show_action_arrow:
+                return
+            ax_, ay_ = float(self._last_action[0]), float(self._last_action[1])
+            mag = math.sqrt(ax_ * ax_ + ay_ * ay_)
+            shaft = self.model.geom('action_arrow_shaft')
+            head_l = self.model.geom('action_arrow_head_l')
+            head_r = self.model.geom('action_arrow_head_r')
+            if mag < 1e-4:
+                # Park underground (size must remain positive at runtime too).
+                shaft.pos[:] = [0, 0, -10]
+                head_l.pos[:] = [0, 0, -10]
+                head_r.pos[:] = [0, 0, -10]
+                return
+            # Scale: action lives in [-1, 1]^2 (||action||_max = sqrt(2)).
+            # Render up to ~3 length units so the arrow is visible without
+            # dominating the cell size (4.0).
+            arrow_len = 1.5 + 1.5 * min(mag / math.sqrt(2.0), 1.0)
+            arrow_width = 0.18
+            angle = math.atan2(ay_, ax_)
+            x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
+
+            # Shaft: centered between the ball and the tip.
+            cx = x + math.cos(angle) * arrow_len * 0.5
+            cy = y + math.sin(angle) * arrow_len * 0.5
+            shaft.pos[:] = [cx, cy, 1.6]
+            shaft.size[:] = [arrow_len / 2, arrow_width / 2, 0.04]
+            shaft.quat[:] = _euler_z_to_quat(angle)
+
+            # Chevron blades: two thin boxes meeting at the tip, each oriented
+            # at ±135° from the shaft direction. The blade extends *backward*
+            # from the tip, so we offset its center by half its length along
+            # its own axis.
+            tip_x = x + math.cos(angle) * arrow_len
+            tip_y = y + math.sin(angle) * arrow_len
+            blade_len = arrow_width * 5.0
+            blade_thickness = arrow_width * 0.9
+            for head_geom, sign in ((head_l, +1.0), (head_r, -1.0)):
+                blade_angle = angle + sign * (3.0 * math.pi / 4.0)
+                bx = tip_x + math.cos(blade_angle) * blade_len * 0.5
+                by = tip_y + math.sin(blade_angle) * blade_len * 0.5
+                head_geom.pos[:] = [bx, by, 1.6]
+                head_geom.size[:] = [blade_len / 2, blade_thickness / 2, 0.04]
+                head_geom.quat[:] = _euler_z_to_quat(blade_angle)
+
         def render(self):
             if self.custom_renderer is None:
                 self.initialize_renderer()
+            # Refresh flow arrows so dynamic fields evolve in the rendered video.
+            # Static fields short-circuit inside update_flow_arrows.
+            self.update_flow_arrows(getattr(self, '_sim_time', 0.0))
+            self._update_action_arrow()
             self.custom_renderer.update_scene(self.data, camera=self.custom_camera)
             return self.custom_renderer.render()
 

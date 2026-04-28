@@ -77,5 +77,7 @@ def config_to_env_kwargs(cfg):
         terminate_at_goal=cfg['env']['terminate_at_goal'],
         goal_tolerance=cfg['env']['goal_tolerance'],
         add_noise_to_goal=cfg['env']['add_noise_to_goal'],
+        add_noise_to_start=cfg['env'].get('add_noise_to_start', True),
         success_timing=cfg['env']['success_timing'],
+        show_action_arrow=cfg['env'].get('show_action_arrow', False),
     )

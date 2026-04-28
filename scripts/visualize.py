@@ -50,13 +50,15 @@ def find_episode_boundaries(terminals):
     return episodes
 
 
-def replay_episode(env, qpos_array):
+def replay_episode(env, qpos_array, actions_array=None):
     dt = env.unwrapped.frame_skip * env.unwrapped.model.opt.timestep
     frames = []
     for t in range(len(qpos_array)):
-        # Update flow arrows to reflect the field at this point in the episode.
-        env.unwrapped.update_flow_arrows(t * dt)
+        # Set the env's sim clock so render() draws the flow at this episode time.
+        env.unwrapped._sim_time = t * dt
         env.unwrapped.data.qpos[:] = qpos_array[t]
+        if actions_array is not None and t < len(actions_array):
+            env.unwrapped._last_action = np.asarray(actions_array[t], dtype=np.float64)
         mujoco.mj_forward(env.unwrapped.model, env.unwrapped.data)
         frame = env.unwrapped.render()
         frames.append(frame)
@@ -70,6 +72,7 @@ def main():
     data = np.load(dataset_path)
     terminals = data['terminals']
     qpos = data['qpos']
+    actions = data['actions'] if 'actions' in data.files else None
     goal_xy_all = data.get('goal_xy', None)
 
     episodes = find_episode_boundaries(terminals)
@@ -98,7 +101,8 @@ def main():
             goal_xy = env.unwrapped.ij_to_xy(tuple(cfg['start_goal']['goal_ij']))
             env.unwrapped.model.geom('target').pos[:2] = goal_xy
 
-        frames = replay_episode(env, qpos[start:end])
+        ep_actions = actions[start:end] if actions is not None else None
+        frames = replay_episode(env, qpos[start:end], actions_array=ep_actions)
         all_frames.extend(frames)
         # Brief black gap between episodes.
         if idx != chosen[-1]:
