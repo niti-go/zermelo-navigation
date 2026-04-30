@@ -1,27 +1,30 @@
 """Generate diverse offline datasets for the Zermelo point maze environment.
 
-Produces ~1000 episodes of a point agent navigating a maze with background fluid
+Produces episodes of a point agent navigating a maze with background fluid
 flow. Each episode picks a random start and goal, then the agent tries to reach
-the goal. The resulting dataset contains a variety of trajectories that reach the goal
-but take different paths, lengths, and energy. It mimics a real-world scenario where
-drones already exist in the real world and
-take slightly noisy diverse trajectories toward a goal. We can attach sensors to
-the drones, collect a dataset, and train an RL algorithm to learn an optimal trajectory
+the goal. The resulting dataset contains a variety of trajectories that reach the
+goal but take different paths, lengths, and energy. It mimics a real-world
+scenario where drones already exist in the real world and take slightly noisy
+diverse trajectories toward a goal. We can attach sensors to the drones,
+collect a dataset, and train an RL algorithm to learn an optimal trajectory
 from the existing drones.
 
-Trajectory diversity comes from two independent mechanisms:
+Trajectory diversity comes from two orthogonal mechanisms:
 
-1. Route diversity (which path the agent takes):
-   - Each episode samples 0-3 random intermediate waypoints between start and goal.
-   - Waypoints are filtered by a detour budget so alternate routes are explored
-     without absurd backtracking.
-   - With maze enabled: BFS grid-cell waypoints, agent follows BFS oracle to reach the
-   next intermediate waypoint.
-   - With maze disabled (open arena): random XY waypoints in continuous space,
-     agent steers directly toward each waypoint.
+1. Route diversity (which path the agent takes) — controlled by `route.*`:
+   - Each episode samples a random number of intermediate waypoints in
+     [route.waypoints[0], route.waypoints[1]].
+   - Waypoints are accepted only if they keep total path length under
+     `route.detour_budget × direct distance`. Same semantics in maze (BFS cell
+     count) and open arena (Euclidean distance).
+   - Maze: BFS grid-cell waypoints, agent follows BFS oracle to each one.
+   - Open arena: random XY waypoints in continuous space, agent steers directly.
 
-2. Agent diversity (how the agent executes the route):
-   Each episode rolls a fresh "personality" with three knobs: noise, inertia, speed.
+2. Agent competence (how well the agent executes) — controlled by `agent.*`:
+   - Three independent dimensions: `noise`, `inertia`, `speed`. Each is a
+     `[min, max]` range; one value is sampled per dimension at episode start.
+   - `agent.drift ∈ [0, 1]` controls within-episode variation (0 = each
+     dimension fixed, 1 = each random-walks across its full sampled range).
 
 All parameters are controlled by a single YAML config file (zermelo_config.yaml).
 
@@ -89,121 +92,142 @@ def oracle_subgoal_from_cache(agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij
     return np.array(ij_to_xy(best_ij))
 
 
-def sample_reachable_waypoints(maze_map, all_cells, start_ij, goal_ij,
-                               max_waypoints, max_detour, bfs_cache):
-    """Sample 0..max_waypoints waypoints that don't create absurd detours."""
-    n_waypoints = np.random.randint(0, max_waypoints + 1)
-    if n_waypoints == 0:
+def sample_waypoints_maze(all_cells, start_ij, goal_ij, n_target,
+                          detour_budget, bfs_cache):
+    """Sample-then-accept waypoints in cell space.
+
+    Picks up to `n_target` random free cells, accepting each if it keeps the
+    cumulative path-through-waypoints + remaining-to-goal under
+    `detour_budget × direct distance`. Identical structure to
+    `sample_waypoints_open` so the two modes produce comparable distributions.
+    """
+    if n_target == 0:
         return []
 
     dist_to_goal = bfs_cache[goal_ij]
+    direct = bfs_cache[start_ij][goal_ij[0], goal_ij[1]]
+    if direct <= 0:
+        return []
+    budget = detour_budget * direct
 
     waypoints = []
     current = start_ij
-    for _ in range(n_waypoints):
-        dist_from_current = bfs_cache[current]
-        direct = dist_from_current[goal_ij[0], goal_ij[1]]
-        if direct <= 0:
-            break
-
-        budget = max_detour * direct
-        candidates = [
-            c for c in all_cells
-            if dist_from_current[c[0], c[1]] > 0
-            and dist_from_current[c[0], c[1]] + dist_to_goal[c[0], c[1]] <= budget
-        ]
-        if not candidates:
-            break
-
-        wp = candidates[np.random.randint(len(candidates))]
-        waypoints.append(wp)
-        current = wp
-
+    path_so_far = 0.0
+    for _ in range(n_target):
+        wp = all_cells[np.random.randint(len(all_cells))]
+        added = bfs_cache[current][wp[0], wp[1]]
+        remaining = dist_to_goal[wp[0], wp[1]]
+        if added <= 0 or remaining < 0:
+            continue  # unreachable from current or unreachable to goal
+        if path_so_far + added + remaining <= budget:
+            waypoints.append(wp)
+            path_so_far += added
+            current = wp
     return waypoints
 
 
-def sample_xy_waypoints(start_xy, goal_xy, xy_bounds, max_waypoints, max_detour):
-    """Sample random XY waypoints in continuous open space (no maze walls).
+def sample_waypoints_open(start_xy, goal_xy, xy_bounds, n_target, detour_budget):
+    """Sample-then-accept waypoints in continuous XY space.
 
-    Returns a list of (x, y) tuples. The detour budget limits total path length
-    relative to the straight-line start→goal distance.
+    Mirror of `sample_waypoints_maze` but with Euclidean distances.
     """
-    n_waypoints = np.random.randint(0, max_waypoints + 1)
-    if n_waypoints == 0:
+    if n_target == 0:
         return []
+
+    direct = float(np.linalg.norm(np.array(goal_xy) - np.array(start_xy)))
+    if direct < 1e-6:
+        return []
+    budget = detour_budget * direct
 
     x_min, x_max, y_min, y_max = xy_bounds
-    direct_dist = np.linalg.norm(np.array(goal_xy) - np.array(start_xy))
-    if direct_dist < 1e-6:
-        return []
-
-    budget = max_detour * direct_dist
-
     waypoints = []
     current = np.array(start_xy)
-    for _ in range(n_waypoints):
-        # Sample a random point in the arena.
+    path_so_far = 0.0
+    for _ in range(n_target):
         wp = np.array([np.random.uniform(x_min, x_max),
                        np.random.uniform(y_min, y_max)])
-
-        # Check detour budget: path so far + this waypoint + remaining to goal.
-        path_so_far = sum(
-            np.linalg.norm(np.array(waypoints[i]) - (np.array(waypoints[i-1]) if i > 0 else current))
-            for i in range(len(waypoints))
-        )
-        added = np.linalg.norm(wp - (np.array(waypoints[-1]) if waypoints else current))
-        remaining = np.linalg.norm(np.array(goal_xy) - wp)
-
+        added = float(np.linalg.norm(wp - current))
+        remaining = float(np.linalg.norm(np.array(goal_xy) - wp))
         if path_so_far + added + remaining <= budget:
             waypoints.append(tuple(wp))
-
+            path_so_far += added
+            current = wp
     return waypoints
 
 
 class AgentPersonality:
-    """Per-episode randomized agent with three knobs: noise, inertia, speed."""
+    """Per-episode randomized agent with three independent dimensions.
 
-    def __init__(self, noise_range, inertia_range, speed_range):
-        self.noise = np.random.uniform(*noise_range)
-        self.inertia = np.random.uniform(*inertia_range)
-        self._speed_range = speed_range
-        self._speed = np.random.uniform(*speed_range)
+    Each of (noise, inertia, speed) is sampled once per episode from its own
+    [min, max] range in agent.*. drift ∈ [0, 1] then random-walks each value
+    within that same range during the episode (0 = fixed, 1 = full range).
+    """
+
+    def __init__(self, noise_range, inertia_range, speed_range, drift):
+        self._dims = {
+            'noise':   self._init_dim(noise_range, drift),
+            'inertia': self._init_dim(inertia_range, drift),
+            'speed':   self._init_dim(speed_range, drift),
+        }
         self._smoothed_dir = None
+
+    @staticmethod
+    def _init_dim(rng, drift):
+        lo, hi = float(rng[0]), float(rng[1])
+        d = float(np.clip(drift, 0.0, 1.0))
+        v0 = float(np.random.uniform(lo, hi))
+        span = max(hi - lo, 1e-9)
+        # Scale walk size to this dimension's range so drift=1 covers it in
+        # ~tens of steps regardless of absolute scale.
+        sigma = d * 0.15 * span
+        revert = 0.05 * (1.0 - d)
+        # At drift=0, pin to the sampled value; otherwise walk within [lo, hi].
+        clip = (lo, hi) if d > 0.0 else (v0, v0)
+        return {'value': v0, 'v0': v0, 'sigma': sigma, 'revert': revert, 'clip': clip}
+
+    def _step_dim(self, dim):
+        dim['value'] += (
+            dim['revert'] * (dim['v0'] - dim['value'])
+            + np.random.normal(0, dim['sigma'])
+        )
+        dim['value'] = float(np.clip(dim['value'], *dim['clip']))
+        return dim['value']
 
     def get_action(self, subgoal_dir):
         if self._smoothed_dir is None:
             self._smoothed_dir = subgoal_dir.copy()
 
+        noise = self._step_dim(self._dims['noise'])
+        inertia = self._step_dim(self._dims['inertia'])
+        speed = self._step_dim(self._dims['speed'])
+
         # Smooth heading with exponential moving average.
-        self._smoothed_dir = self.inertia * self._smoothed_dir + (1 - self.inertia) * subgoal_dir
+        self._smoothed_dir = inertia * self._smoothed_dir + (1 - inertia) * subgoal_dir
         norm = np.linalg.norm(self._smoothed_dir)
         if norm > 1e-6:
             self._smoothed_dir = self._smoothed_dir / norm
 
-        # Random-walk the speed (mean-reverting toward center of range).
-        mid = 0.5 * (self._speed_range[0] + self._speed_range[1])
-        self._speed += 0.05 * (mid - self._speed) + np.random.normal(0, 0.03)
-        self._speed = np.clip(self._speed, self._speed_range[0], self._speed_range[1])
-
-        action = self._speed * self._smoothed_dir + np.random.normal(0, self.noise, 2)
+        action = speed * self._smoothed_dir + np.random.normal(0, noise, 2)
         return np.clip(action, -1, 1)
 
 
-def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg,
-                     traj_cfg, pers_cfg, reward_cfg):
-    """Run a single episode and return the per-step data plus episode summary stats."""
+def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
+    """Run a single episode and return per-step data plus episode summary stats."""
     maze_enabled = cfg['maze']['enabled']
-    fixed_init_ij = tuple(sg_cfg['start_ij'])
-    fixed_goal_ij = tuple(sg_cfg['goal_ij'])
+    task_cfg = cfg['task']
+    route_cfg = cfg['route']
+    agent_cfg = cfg['agent']
+    run_cfg = cfg['run']
+    reward_cfg = cfg['reward']
 
     if maze_enabled:
         xy_to_ij = env.unwrapped.xy_to_ij
         ij_to_xy = env.unwrapped.ij_to_xy
 
     # Choose start and goal for this episode.
-    if sg_cfg['fixed']:
-        init_ij = fixed_init_ij
-        goal_ij = fixed_goal_ij
+    if task_cfg['start_goal_mode'] == 'fixed':
+        init_ij = tuple(task_cfg['fixed_start_ij'])
+        goal_ij = tuple(task_cfg['fixed_goal_ij'])
     else:
         init_ij = all_cells[np.random.randint(len(all_cells))]
         goal_ij = all_cells[np.random.randint(len(all_cells))]
@@ -211,19 +235,21 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg
             goal_ij = all_cells[np.random.randint(len(all_cells))]
 
     # Sample intermediate waypoints to force diverse routes.
+    wp_min, wp_max = route_cfg['waypoints']
+    n_waypoints = np.random.randint(wp_min, wp_max + 1)
+    detour_budget = route_cfg['detour_budget']
+
     if maze_enabled:
-        waypoints_ij = sample_reachable_waypoints(
-            maze_map, all_cells, init_ij, goal_ij,
-            traj_cfg['max_waypoints'], traj_cfg['max_detour'], bfs_cache,
+        waypoints_ij = sample_waypoints_maze(
+            all_cells, init_ij, goal_ij, n_waypoints, detour_budget, bfs_cache,
         )
         route_ij = waypoints_ij + [goal_ij]
         route_xy = [np.array(env.unwrapped.ij_to_xy(ij)) for ij in route_ij]
     else:
         start_xy = np.array(env.unwrapped.ij_to_xy(init_ij))
         goal_xy = np.array(env.unwrapped.ij_to_xy(goal_ij))
-        waypoints_xy = sample_xy_waypoints(
-            start_xy, goal_xy, xy_bounds,
-            traj_cfg['max_waypoints'], traj_cfg['max_detour'],
+        waypoints_xy = sample_waypoints_open(
+            start_xy, goal_xy, xy_bounds, n_waypoints, detour_budget,
         )
         route_xy = [np.array(wp) for wp in waypoints_xy] + [goal_xy]
 
@@ -231,9 +257,10 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg
     current_target_xy = route_xy[route_idx]
 
     personality = AgentPersonality(
-        noise_range=pers_cfg['noise'],
-        inertia_range=pers_cfg['inertia'],
-        speed_range=pers_cfg['speed'],
+        noise_range=agent_cfg['noise'],
+        inertia_range=agent_cfg['inertia'],
+        speed_range=agent_cfg['speed'],
+        drift=agent_cfg.get('drift', 0.0),
     )
 
     ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
@@ -247,8 +274,11 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg
     ep_energy_r = 0.0
     ep_time_r = 0.0
     ep_dist_r = 0.0
-    wp_tol = traj_cfg['waypoint_tolerance']
-    wp_timeout = traj_cfg.get('waypoint_timeout', 200)
+    wp_tol = route_cfg['waypoint_tolerance']
+    # Per-waypoint timeout as a fraction of the episode budget; this auto-
+    # scales with max_episode_steps so the route can never silently exceed
+    # the episode budget.
+    wp_timeout = max(1, int(route_cfg['waypoint_step_budget'] * run_cfg['max_episode_steps']))
     wp_steps = 0
 
     info = {}
@@ -328,9 +358,9 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds, sg_cfg
 
 def _build_env_and_caches(cfg):
     """Build env + per-worker BFS cache / xy bounds. Returned as a dict."""
-    ds_cfg = cfg['dataset']
+    run_cfg = cfg['run']
     env_kwargs = config_to_env_kwargs(cfg)
-    env_kwargs['max_episode_steps'] = ds_cfg['max_episode_steps']
+    env_kwargs['max_episode_steps'] = run_cfg['max_episode_steps']
     env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
 
     maze_map = env.unwrapped.maze_map
@@ -363,10 +393,6 @@ def _worker_main(args):
     np.random.seed(seed)
 
     ctx = _build_env_and_caches(cfg)
-    sg_cfg = cfg['start_goal']
-    traj_cfg = cfg['trajectory']
-    pers_cfg = cfg['personality']
-    reward_cfg = cfg['reward']
 
     dataset = defaultdict(list)
     all_stats = []
@@ -374,8 +400,8 @@ def _worker_main(args):
         if worker_id == 0 else range(n_episodes)
     for _ in iterator:
         ep_data, stats = _run_one_episode(
-            ctx['env'], cfg, ctx['maze_map'], ctx['all_cells'], ctx['bfs_cache'],
-            ctx['xy_bounds'], sg_cfg, traj_cfg, pers_cfg, reward_cfg,
+            ctx['env'], cfg, ctx['maze_map'], ctx['all_cells'],
+            ctx['bfs_cache'], ctx['xy_bounds'],
         )
         for k, v in ep_data.items():
             dataset[k].extend(v)
@@ -388,9 +414,9 @@ def _worker_main(args):
 def main(_):
     cfg = load_config(FLAGS.config)
 
-    ds_cfg = cfg['dataset']
+    run_cfg = cfg['run']
     reward_cfg = cfg['reward']
-    num_episodes = ds_cfg['num_episodes']
+    num_episodes = run_cfg['num_episodes']
 
     n_workers = min(FLAGS.num_workers, num_episodes)
 
@@ -399,7 +425,7 @@ def main(_):
     for i in range(num_episodes % n_workers):
         per_worker[i] += 1
 
-    base_seed = ds_cfg['seed']
+    base_seed = run_cfg['seed']
     worker_args = [
         (cfg, base_seed + 1000 * wid, per_worker[wid], wid)
         for wid in range(n_workers)
@@ -407,7 +433,6 @@ def main(_):
 
     print(f'Generating {num_episodes} episodes across {n_workers} worker(s)...')
     if cfg['maze']['enabled']:
-        # Each worker will build its own BFS cache; report once.
         print('(each worker will precompute its own BFS cache at startup)')
 
     if n_workers == 1:
@@ -426,25 +451,15 @@ def main(_):
             dataset[k].extend(v)
         stats_list.extend(worker_stats)
 
-    ep_lengths = [s['length'] for s in stats_list]
-    ep_action_norms = [s['action_norm'] for s in stats_list]
-    ep_successes = [s['success'] for s in stats_list]
-    ep_goal_rewards = [s['goal_r'] for s in stats_list]
-    ep_energy_costs = [s['energy_r'] for s in stats_list]
-    ep_time_costs = [s['time_r'] for s in stats_list]
-    ep_dist_costs = [s['dist_r'] for s in stats_list]
-    ep_dist_sums = [s['dist_sum'] for s in stats_list]
-    total_steps = sum(ep_lengths)
-
-    # --- Dataset stats for reward parameter tuning ---
-    ep_lengths = np.array(ep_lengths)
-    ep_action_norms = np.array(ep_action_norms)
-    ep_successes = np.array(ep_successes)
-    ep_goal_rewards = np.array(ep_goal_rewards)
-    ep_energy_costs = np.array(ep_energy_costs)
-    ep_time_costs = np.array(ep_time_costs)
-    ep_dist_costs = np.array(ep_dist_costs)
-    ep_dist_sums = np.array(ep_dist_sums)
+    ep_lengths = np.array([s['length'] for s in stats_list])
+    ep_action_norms = np.array([s['action_norm'] for s in stats_list])
+    ep_successes = np.array([s['success'] for s in stats_list])
+    ep_goal_rewards = np.array([s['goal_r'] for s in stats_list])
+    ep_energy_costs = np.array([s['energy_r'] for s in stats_list])
+    ep_time_costs = np.array([s['time_r'] for s in stats_list])
+    ep_dist_costs = np.array([s['dist_r'] for s in stats_list])
+    ep_dist_sums = np.array([s['dist_sum'] for s in stats_list])
+    total_steps = int(ep_lengths.sum())
     ep_total_rewards = ep_goal_rewards + ep_energy_costs + ep_time_costs + ep_dist_costs
 
     print(f'\n=== Dataset stats (use these to set reward params) ===')
@@ -460,16 +475,17 @@ def main(_):
     print(f'\n--- Reward breakdown (current weights: goal={reward_cfg["goal_reward"]}, '
           f'energy={reward_cfg["energy_weight"]}, time={reward_cfg["time_weight"]}, '
           f'distance={reward_cfg["distance_weight"]}) ---')
+    abs_total = abs(ep_total_rewards).mean() + 1e-9
     print(f'  Total reward  — mean: {ep_total_rewards.mean():.3f}  '
           f'min: {ep_total_rewards.min():.3f}  max: {ep_total_rewards.max():.3f}')
     print(f'  Goal portion  — mean: {ep_goal_rewards.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_goal_rewards.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+          f'(% of |total|: {100*abs(ep_goal_rewards.mean()) / abs_total:.0f}%)')
     print(f'  Energy cost   — mean: {ep_energy_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_energy_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+          f'(% of |total|: {100*abs(ep_energy_costs.mean()) / abs_total:.0f}%)')
     print(f'  Time cost     — mean: {ep_time_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_time_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+          f'(% of |total|: {100*abs(ep_time_costs.mean()) / abs_total:.0f}%)')
     print(f'  Distance cost — mean: {ep_dist_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_dist_costs.mean()) / (abs(ep_total_rewards).mean() + 1e-9):.0f}%)')
+          f'(% of |total|: {100*abs(ep_dist_costs.mean()) / abs_total:.0f}%)')
 
     avg_len = ep_lengths.mean()
     avg_anorm = ep_action_norms.mean()
@@ -480,10 +496,9 @@ def main(_):
           f'(so {avg_len:.0f} steps × {avg_anorm:.2f} avg_norm × energy_weight ≈ 0.5)')
     print(f'  distance_weight ≈ {0.5 / max(avg_dist_sum, 1e-9):.5f}   '
           f'(so Σdist={avg_dist_sum:.0f} × distance_weight ≈ 0.5)')
-    print(f'  (adjust up/down to make the gap between good and bad episodes larger/smaller)')
     print(f'  Run: python scripts/analyze_rewards.py  to visualize and sweep weights\n')
 
-    save_path = ds_cfg['save_path']
+    save_path = run_cfg['save_path']
     pathlib.Path(save_path).parent.mkdir(parents=True, exist_ok=True)
 
     save_dataset = {}

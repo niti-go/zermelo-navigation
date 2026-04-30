@@ -314,41 +314,34 @@ def make_zermelo_maze_env(*args, **kwargs):
                     conaffinity='0',
                 )
 
-            # Action-arrow geoms (size/pose updated per render). We attach them
-            # to the world body so they can be re-oriented at runtime via
-            # geom.quat (body-attached geom euler is baked at compile time).
-            # Hidden initially (size 0) — render() resizes them when there is
-            # a non-trivial last action.
             if self._show_action_arrow:
-                # MuJoCo requires positive sizes at compile time; we hide the
-                # arrow by parking it underground until the first render() call
-                # repositions it.
+                # Shaft = thin cylinder, head = stubby fat cylinder at the tip.
+                # Both lie horizontally (rotated to point along the action),
+                # which reads as an arrow much more cleanly than rotated boxes.
+                # Parked underground at compile time; render() repositions and
+                # resizes them each frame from the agent's last action.
                 ET.SubElement(
                     worldbody,
                     'geom',
                     name='action_arrow_shaft',
-                    type='box',
+                    type='cylinder',
                     pos='0 0 -10',
-                    size='0.01 0.01 0.01',
-                    rgba='1.0 1.0 0.2 0.95',
+                    size='0.08 0.5',
+                    rgba='1.0 0.9 0.15 1.0',
                     contype='0',
                     conaffinity='0',
                 )
-                # Chevron arrowhead: two thin blades rotated ±135° from the
-                # shaft direction so they meet at the tip and form a `>` shape
-                # when viewed from above.
-                for side in ('l', 'r'):
-                    ET.SubElement(
-                        worldbody,
-                        'geom',
-                        name=f'action_arrow_head_{side}',
-                        type='box',
-                        pos='0 0 -10',
-                        size='0.01 0.01 0.01',
-                        rgba='1.0 0.85 0.1 1.0',
-                        contype='0',
-                        conaffinity='0',
-                    )
+                ET.SubElement(
+                    worldbody,
+                    'geom',
+                    name='action_arrow_head',
+                    type='cylinder',
+                    pos='0 0 -10',
+                    size='0.22 0.18',
+                    rgba='1.0 0.7 0.05 1.0',
+                    contype='0',
+                    conaffinity='0',
+                )
 
         def update_flow_arrows(self, t=0.0):
             """Update MuJoCo arrow geoms to reflect the flow field at time *t*.
@@ -532,50 +525,46 @@ def make_zermelo_maze_env(*args, **kwargs):
             return ob, reward, terminated, truncated, info
 
         def _update_action_arrow(self):
-            """Resize/orient the action arrow geom from the last action."""
+            """Resize/orient the action arrow geoms from the last action."""
             if not self._show_action_arrow:
                 return
             ax_, ay_ = float(self._last_action[0]), float(self._last_action[1])
             mag = math.sqrt(ax_ * ax_ + ay_ * ay_)
             shaft = self.model.geom('action_arrow_shaft')
-            head_l = self.model.geom('action_arrow_head_l')
-            head_r = self.model.geom('action_arrow_head_r')
+            head = self.model.geom('action_arrow_head')
             if mag < 1e-4:
-                # Park underground (size must remain positive at runtime too).
                 shaft.pos[:] = [0, 0, -10]
-                head_l.pos[:] = [0, 0, -10]
-                head_r.pos[:] = [0, 0, -10]
+                head.pos[:] = [0, 0, -10]
                 return
             # Scale: action lives in [-1, 1]^2 (||action||_max = sqrt(2)).
-            # Render up to ~3 length units so the arrow is visible without
-            # dominating the cell size (4.0).
             arrow_len = 1.5 + 1.5 * min(mag / math.sqrt(2.0), 1.0)
-            arrow_width = 0.18
+            head_len = 0.35
+            shaft_len = max(arrow_len - head_len, 0.1)
             angle = math.atan2(ay_, ax_)
             x, y = float(self.data.qpos[0]), float(self.data.qpos[1])
 
-            # Shaft: centered between the ball and the tip.
-            cx = x + math.cos(angle) * arrow_len * 0.5
-            cy = y + math.sin(angle) * arrow_len * 0.5
-            shaft.pos[:] = [cx, cy, 1.6]
-            shaft.size[:] = [arrow_len / 2, arrow_width / 2, 0.04]
-            shaft.quat[:] = _euler_z_to_quat(angle)
+            # Cylinders extend along their local +Z axis. Rotate +Z onto the
+            # horizontal direction (ax_, ay_, 0): 90° about (-ay_, ax_, 0)/mag.
+            inv = 1.0 / mag
+            kx, ky = -ay_ * inv, ax_ * inv
+            half = math.pi / 4.0  # half of 90°
+            s = math.sin(half)
+            quat = [math.cos(half), kx * s, ky * s, 0.0]
 
-            # Chevron blades: two thin boxes meeting at the tip, each oriented
-            # at ±135° from the shaft direction. The blade extends *backward*
-            # from the tip, so we offset its center by half its length along
-            # its own axis.
-            tip_x = x + math.cos(angle) * arrow_len
-            tip_y = y + math.sin(angle) * arrow_len
-            blade_len = arrow_width * 5.0
-            blade_thickness = arrow_width * 0.9
-            for head_geom, sign in ((head_l, +1.0), (head_r, -1.0)):
-                blade_angle = angle + sign * (3.0 * math.pi / 4.0)
-                bx = tip_x + math.cos(blade_angle) * blade_len * 0.5
-                by = tip_y + math.sin(blade_angle) * blade_len * 0.5
-                head_geom.pos[:] = [bx, by, 1.6]
-                head_geom.size[:] = [blade_len / 2, blade_thickness / 2, 0.04]
-                head_geom.quat[:] = _euler_z_to_quat(blade_angle)
+            # Shaft: centered between the agent and the head's base.
+            shaft_cx = x + math.cos(angle) * shaft_len * 0.5
+            shaft_cy = y + math.sin(angle) * shaft_len * 0.5
+            shaft.pos[:] = [shaft_cx, shaft_cy, 1.6]
+            shaft.size[:] = [0.08, shaft_len * 0.5, 0.0]
+            shaft.quat[:] = quat
+
+            # Head: a stubbier, fatter cylinder centered between the shaft tip
+            # and the arrow tip.
+            head_cx = x + math.cos(angle) * (shaft_len + head_len * 0.5)
+            head_cy = y + math.sin(angle) * (shaft_len + head_len * 0.5)
+            head.pos[:] = [head_cx, head_cy, 1.6]
+            head.size[:] = [0.22, head_len * 0.5, 0.0]
+            head.quat[:] = quat
 
         def render(self):
             if self.custom_renderer is None:

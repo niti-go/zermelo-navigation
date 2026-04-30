@@ -51,7 +51,7 @@ def main(_):
         tw = FLAGS.time_weight if FLAGS.time_weight is not None else 0.0
         dw = FLAGS.distance_weight if FLAGS.distance_weight is not None else 0.0
 
-    dataset_path = FLAGS.dataset or cfg['dataset']['save_path']
+    dataset_path = FLAGS.dataset or cfg['run']['save_path']
     print(f'Loading: {dataset_path}')
     data = dict(np.load(dataset_path))
 

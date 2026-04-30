@@ -28,10 +28,10 @@ PYTHONPATH=. python scripts/visualize.py
 # 6. Train BC (uses flowrl conda env, can run from any directory)
 conda activate flowrl
 wandb login
-CUDA_VISIBLE_DEVICES=0 python ~/zermelo-navigation/experiments/zermelo/bc_zermelo.py \
+CUDA_VISIBLE_DEVICES=6 python ~/zermelo-navigation/experiments/zermelo/bc_zermelo.py \
     --train_steps=500000 \
     --seed=0 \
-    --proj_wandb=zermelo \
+    --proj_wandb=zermelo_hit_dynamic \
     --run_group=bc \
     --wandb_online=True
 
@@ -147,7 +147,7 @@ def make_eval_env(zermelo_config_path=None):
     cfg = load_config(zermelo_config_path)
     env_kwargs = config_to_env_kwargs(cfg)
     env_kwargs['fixed_start_goal'] = True
-    env_kwargs['max_episode_steps'] = cfg['dataset']['max_episode_steps']
+    env_kwargs['max_episode_steps'] = cfg['run']['max_episode_steps']
     return gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
 
 
@@ -209,22 +209,31 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
+    # Load the zermelo YAML config up front so we can log it alongside argparse flags.
+    zermelo_cfg = load_config(args.zermelo_config)
+    zermelo_cfg_src = args.zermelo_config or os.path.join(
+        _repo_root, 'configs', 'zermelo_config.yaml')
+
     # Wandb.
     exp_name = f'bc_sd{args.seed:03d}_{time.strftime("%Y%m%d_%H%M%S")}'
     entity = args.wandb_entity if args.wandb_entity != 'None' else None
     os.environ["WANDB_MODE"] = "online" if args.wandb_online else "offline"
     wandb.init(project=args.proj_wandb, group=args.run_group, name=exp_name,
-               entity=entity, config=vars(args))
+               entity=entity,
+               config={**vars(args), 'zermelo_config_yaml': zermelo_cfg})
+    if os.path.isfile(zermelo_cfg_src):
+        wandb.save(zermelo_cfg_src, policy='now')
 
     save_dir = os.path.join(args.save_dir, args.proj_wandb, args.run_group, exp_name)
     os.makedirs(save_dir, exist_ok=True)
     with open(os.path.join(save_dir, 'flags.json'), 'w') as f:
         json.dump(vars(args), f, indent=2)
+    with open(os.path.join(save_dir, 'zermelo_config.json'), 'w') as f:
+        json.dump(zermelo_cfg, f, indent=2)
 
     # Dataset.
     if args.zermelo_dataset is None:
-        cfg = load_config(args.zermelo_config)
-        args.zermelo_dataset = os.path.join(_repo_root, cfg['dataset']['save_path'])
+        args.zermelo_dataset = os.path.join(_repo_root, zermelo_cfg['run']['save_path'])
 
     train_data, val_data = load_zermelo_dataset(args.zermelo_dataset)
 

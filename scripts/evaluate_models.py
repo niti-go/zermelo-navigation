@@ -7,7 +7,7 @@ stitched together with algorithm labels), trajectory plots, and metrics.
 Usage:
     conda activate flowrl
     cd ~/zermelo-navigation
-    PYTHONPATH=. CUDA_VISIBLE_DEVICES=4 python scripts/evaluate_models.py
+    PYTHONPATH=. CUDA_VISIBLE_DEVICES=2 python scripts/evaluate_models.py
 """
 import argparse
 import glob
@@ -34,12 +34,13 @@ from tqdm import tqdm
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, _repo_root)
 import zermelo_env  # noqa — registers gymnasium envs
-from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
+from zermelo_env.zermelo_config import load_config, config_to_env_kwargs, get_flow_runtime
 from zermelo_env.zermelo_flow import DynamicNetCDFFlowField, DynamicTGVFlowField, FlowField
 
 # ── Config ───────────────────────────────────────────────────────────────────
 RESULTS_DIR = os.path.join(_repo_root, 'results', 'zermelo_hit_offline_results')
-NUM_EVAL_EPISODES = 30
+NUM_EVAL_EPISODES = 200
+NUM_VIDEO_EPISODES = 10  # Only render videos for the first N episodes; rest run headless.
 VIDEO_FPS = 30
 RENDER_SIZE = 400
 
@@ -123,7 +124,7 @@ def make_eval_env(render_mode=None):
     # jitter so both endpoints sit at their cell centers deterministically.
     env_kwargs['add_noise_to_goal'] = False
     env_kwargs['add_noise_to_start'] = False
-    env_kwargs['max_episode_steps'] = cfg['dataset']['max_episode_steps']
+    env_kwargs['max_episode_steps'] = cfg['run']['max_episode_steps']
     kw = {}
     if render_mode:
         kw = dict(render_mode=render_mode, width=RENDER_SIZE, height=RENDER_SIZE)
@@ -280,7 +281,7 @@ def load_dt(device):
     model.eval()
     # Compute target return from dataset
     cfg = load_config(None)
-    dataset_path = os.path.join(_repo_root, cfg['dataset']['save_path'])
+    dataset_path = os.path.join(_repo_root, cfg['run']['save_path'])
     data = dict(np.load(dataset_path))
     rewards = data['rewards'].astype(np.float32)
     terminals = data['terminals'].astype(np.float32)
@@ -398,21 +399,18 @@ def stitch_episode_video(episode_frames, output_path):
 def plot_trajectories(all_results):
     """Plot 2D trajectories with flow field background."""
     cfg = load_config(None)
-    dyn_cfg = cfg['flow'].get('dynamic', {}) or {}
+    dyn_cfg, static_path = get_flow_runtime(cfg)
     if dyn_cfg.get('enabled', False):
-        mode = dyn_cfg.get('mode', 'tgv')
-        shared = {
-            'x_range': dyn_cfg.get('x_range', [-4.0, 24.0]),
-            'y_range': dyn_cfg.get('y_range', [-4.0, 24.0]),
-        }
+        mode = dyn_cfg['mode']
         if mode == 'netcdf':
-            flow = DynamicNetCDFFlowField({**dyn_cfg.get('netcdf', {}), **shared})
+            flow = DynamicNetCDFFlowField({**dyn_cfg.get('netcdf', {}),
+                                            'x_range': dyn_cfg['x_range'],
+                                            'y_range': dyn_cfg['y_range']})
         else:
             flow = DynamicTGVFlowField(dyn_cfg)
         flow_t = 0.0
     else:
-        flow_path = os.path.join(_repo_root, cfg['flow']['field_path'])
-        flow = FlowField(flow_path)
+        flow = FlowField(os.path.join(_repo_root, static_path))
         flow_t = None
     maze_unit, offset = 4.0, 4.0
 
@@ -470,26 +468,23 @@ def animate_trajectories(all_results, fps=30, env_dt=0.1):
     evolving flow field. Output: one MP4 with three side-by-side panels.
     """
     cfg = load_config(None)
-    dyn_cfg = cfg['flow'].get('dynamic', {}) or {}
+    dyn_cfg, static_path = get_flow_runtime(cfg)
     if dyn_cfg.get('enabled', False):
-        mode = dyn_cfg.get('mode', 'tgv')
-        shared = {
-            'x_range': dyn_cfg.get('x_range', [-4.0, 24.0]),
-            'y_range': dyn_cfg.get('y_range', [-4.0, 24.0]),
-        }
+        mode = dyn_cfg['mode']
         if mode == 'netcdf':
             netcdf_cfg = dict(dyn_cfg.get('netcdf', {}))
             # The animation queries the same time index 3x per frame (one per
             # panel); bump the cache so we don't thrash on slice loads.
             netcdf_cfg.setdefault('slice_cache_size', 8)
             netcdf_cfg['slice_cache_size'] = max(int(netcdf_cfg['slice_cache_size']), 8)
-            flow = DynamicNetCDFFlowField({**netcdf_cfg, **shared})
+            flow = DynamicNetCDFFlowField({**netcdf_cfg,
+                                            'x_range': dyn_cfg['x_range'],
+                                            'y_range': dyn_cfg['y_range']})
         else:
             flow = DynamicTGVFlowField(dyn_cfg)
         flow_is_dynamic = True
     else:
-        flow_path = os.path.join(_repo_root, cfg['flow']['field_path'])
-        flow = FlowField(flow_path)
+        flow = FlowField(os.path.join(_repo_root, static_path))
         flow_is_dynamic = False
 
     # Pre-compute trajectories as fixed-length arrays. After an episode ends,
@@ -620,18 +615,86 @@ def plot_comparison(all_results):
     print(f'  Saved {path}')
 
 
+def _dataset_episode_returns():
+    """Return per-episode returns from the offline dataset, or None if missing."""
+    cfg = load_config(None)
+    dataset_path = os.path.join(_repo_root, cfg['run']['save_path'])
+    if not os.path.exists(dataset_path):
+        return None
+    data = np.load(dataset_path)
+    rewards = data['rewards'].astype(np.float64)
+    terminals = data['terminals'].astype(np.float32)
+    ends = np.where(terminals > 0.5)[0]
+    if len(ends) == 0:
+        return None
+    starts = np.concatenate([[0], ends[:-1] + 1])
+    return np.array([rewards[s:e + 1].sum() for s, e in zip(starts, ends)])
+
+
+def plot_reward_histogram(all_results):
+    """Stacked per-algorithm histograms of episode returns plus the offline
+    dataset distribution (shared x-axis)."""
+    dataset_returns = _dataset_episode_returns()
+
+    all_returns = [e['return'] for algo in ALGO_ORDER for e in all_results[algo]]
+    if dataset_returns is not None:
+        all_returns = list(all_returns) + dataset_returns.tolist()
+    if not all_returns:
+        return
+    lo = max(-25.0, float(np.min(all_returns)))
+    hi = float(np.max(all_returns))
+    if hi <= lo:
+        hi = lo + 1.0
+    bins = np.linspace(lo, hi, 51)
+
+    panels = [(algo, [e['return'] for e in all_results[algo]],
+               ALGO_COLORS[algo],
+               f'{algo}  (mean={np.mean([e["return"] for e in all_results[algo]]):.1f}, '
+               f'success={np.mean([e["success"] for e in all_results[algo]]):.0%})')
+              for algo in ALGO_ORDER]
+    if dataset_returns is not None:
+        panels.append(('Offline dataset', dataset_returns, '#7f7f7f',
+                       f'Offline dataset  (n={len(dataset_returns)}, '
+                       f'mean={dataset_returns.mean():.1f})'))
+
+    fig, axes = plt.subplots(len(panels), 1, figsize=(8, 2.4 * len(panels)),
+                             sharex=True)
+    for ax, (_, rets, color, title) in zip(axes, panels):
+        # Clip values to the visible range so episodes below the cutoff pile
+        # into the leftmost bin instead of being silently dropped.
+        rets_clipped = np.clip(rets, lo, hi)
+        ax.hist(rets_clipped, bins=bins, color=color, alpha=0.85,
+                edgecolor='black', linewidth=0.4)
+        ax.set_xlim(lo, hi)
+        # Each panel has its own y-axis since the dataset has ~100x more
+        # episodes than the eval set; a shared y would flatten the eval rows.
+        ax.set_ylabel('Episodes')
+        ax.set_title(title, loc='left', fontsize=11)
+        ax.grid(True, alpha=0.3, axis='y')
+    axes[-1].set_xlabel('Episode return')
+    fig.suptitle('Distribution of episode returns', fontsize=13)
+    fig.tight_layout()
+    path = os.path.join(RESULTS_DIR, 'reward_histogram.png')
+    fig.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--episodes', type=int, default=NUM_EVAL_EPISODES)
+    parser.add_argument('--num-videos', type=int, default=NUM_VIDEO_EPISODES,
+                        help='Render videos only for the first N episodes; '
+                             'remaining episodes run headless. Set 0 to disable.')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--no-video', action='store_true')
     args = parser.parse_args()
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
     device = torch.device(args.device)
-    record_video = not args.no_video
+    num_videos = 0 if args.no_video else min(args.num_videos, args.episodes)
     t0 = time.time()
 
     # Load all models once
@@ -640,23 +703,29 @@ def main():
     dt_model, dt_obs_mean, dt_obs_std, dt_flags, target_return = load_dt(device)
     mfql_get_action = load_mfql()
 
-    # Create env
-    env = make_eval_env(render_mode='rgb_array' if record_video else None)
+    # Create envs: a rendering one for the first `num_videos` episodes, and a
+    # headless one for the rest (skips MuJoCo render calls — much faster).
+    render_env = make_eval_env(render_mode='rgb_array') if num_videos > 0 else None
+    headless_env = make_eval_env(render_mode=None) if num_videos < args.episodes else None
     free_cells = get_free_cells()
     rng = np.random.default_rng(42)
 
-    if record_video:
+    if num_videos > 0:
         video_dir = os.path.join(RESULTS_DIR, 'videos')
         os.makedirs(video_dir, exist_ok=True)
 
     # Per-algorithm results
     all_results = {algo: [] for algo in ALGO_ORDER}
 
-    print(f'\nRunning {args.episodes} episodes (same start/goal for all 3 algos)...\n')
+    print(f'\nRunning {args.episodes} episodes (same start/goal for all 3 algos); '
+          f'rendering videos for first {num_videos}.\n')
     for ep_idx in tqdm(range(args.episodes), desc='Episodes'):
         # Sample start/goal for this episode
         init_ij, goal_ij = sample_start_goal(free_cells, rng)
         reset_opts = {'task_info': {'init_ij': init_ij, 'goal_ij': goal_ij}}
+
+        record_this = ep_idx < num_videos
+        env = render_env if record_this else headless_env
 
         # Run all 3 policies on the same start/goal
         bc_ep = run_bc_episode(bc_policy, bc_obs_mean, bc_obs_std, env, device,
@@ -670,7 +739,7 @@ def main():
             all_results[algo].append({k: v for k, v in ep.items() if k != 'frames'})
 
         # Stitch video for this episode
-        if record_video:
+        if record_this:
             labeled_frames = []
             for algo, ep in zip(ALGO_ORDER, [bc_ep, dt_ep, mfql_ep]):
                 label = f'{algo} (ret={ep["return"]:.1f})'
@@ -679,7 +748,10 @@ def main():
             video_path = os.path.join(video_dir, f'episode_{ep_idx + 1:02d}.mp4')
             stitch_episode_video(labeled_frames, video_path)
 
-    env.close()
+    if render_env is not None:
+        render_env.close()
+    if headless_env is not None:
+        headless_env.close()
 
     # ── Print results ──
     print('\n' + '=' * 60)
@@ -701,6 +773,7 @@ def main():
     plot_trajectories(all_results)
     animate_trajectories(all_results)
     plot_comparison(all_results)
+    plot_reward_histogram(all_results)
 
     # Save results JSON
     results_path = os.path.join(RESULTS_DIR, 'eval_results.json')
@@ -708,7 +781,7 @@ def main():
         json.dump(all_results, f)
     print(f'  Saved {results_path}')
 
-    if record_video:
+    if num_videos > 0:
         print(f'  Videos saved to {os.path.join(RESULTS_DIR, "videos")}')
 
     print(f'\nDone in {time.time() - t0:.0f}s. All outputs in: {RESULTS_DIR}')

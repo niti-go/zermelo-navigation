@@ -28,13 +28,13 @@ This saves a video of 5 random trajectories to datasets/video.mp4
 # 6. Train MeanFlowQL (uses flowrl conda env, can run from any directory)
 conda activate flowrl
 wandb login
-CUDA_VISIBLE_DEVICES=0 python ~/zermelo-navigation/experiments/zermelo/meanflowql_zermelo.py \
+CUDA_VISIBLE_DEVICES=4 python ~/zermelo-navigation/experiments/zermelo/meanflowql_zermelo.py \
     --offline_steps=1000000 \
     --seed=0 \
     --save_interval=50000 \
     --agent.alpha=2000 \
     --agent.num_candidates=5 \
-    --proj_wandb=zermelo \
+    --proj_wandb=zermelo_hit_dynamic \
     --run_group=meanflowql \
     --wandb_online=True
 
@@ -223,7 +223,7 @@ def make_zermelo_eval_env(zermelo_config_path=None):
     env_kwargs = config_to_env_kwargs(cfg)
     # Use fixed start/goal for reproducible evaluation.
     env_kwargs['fixed_start_goal'] = True
-    env_kwargs['max_episode_steps'] = cfg['dataset']['max_episode_steps']
+    env_kwargs['max_episode_steps'] = cfg['run']['max_episode_steps']
 
     env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
     env = EpisodeMonitor(env)
@@ -232,6 +232,11 @@ def make_zermelo_eval_env(zermelo_config_path=None):
 
 def main(_):
     """Main training function for MeanFlowQL on Zermelo navigation."""
+    # Load the zermelo YAML config up front so we can log it alongside flags.
+    zermelo_cfg = load_config(FLAGS.zermelo_config)
+    zermelo_cfg_src = FLAGS.zermelo_config or os.path.join(
+        _repo_root, 'configs', 'zermelo_config.yaml')
+
     # Initialize experiment logging
     exp_name = get_exp_name(FLAGS.seed)
     if FLAGS.wandb_online:
@@ -243,20 +248,26 @@ def main(_):
                 entity=entity, mode=os.environ["WANDB_MODE"],
                 wandb_output_dir=FLAGS.wandb_save_dir)
 
+    # setup_wandb only logs argparse-style flags; attach the parsed YAML config too.
+    wandb.config.update({'zermelo_config_yaml': zermelo_cfg}, allow_val_change=True)
+    if os.path.isfile(zermelo_cfg_src):
+        wandb.save(zermelo_cfg_src, policy='now')
+
     FLAGS.save_dir = os.path.join(FLAGS.save_dir, wandb.run.project, FLAGS.run_group, exp_name)
     print(f"Saving results to {FLAGS.save_dir}")
     os.makedirs(FLAGS.save_dir, exist_ok=True)
     flag_dict = get_flag_dict()
     with open(os.path.join(FLAGS.save_dir, 'flags.json'), 'w') as f:
         json.dump(flag_dict, f, default=str)
+    with open(os.path.join(FLAGS.save_dir, 'zermelo_config.json'), 'w') as f:
+        json.dump(zermelo_cfg, f, indent=2, default=str)
 
     config = FLAGS.agent
 
     # Resolve dataset path.
     if FLAGS.zermelo_dataset is None:
-        cfg = load_config(FLAGS.zermelo_config)
         # save_path in config is relative to repo root, not CWD.
-        FLAGS.zermelo_dataset = os.path.join(_repo_root, cfg['dataset']['save_path'])
+        FLAGS.zermelo_dataset = os.path.join(_repo_root, zermelo_cfg['run']['save_path'])
 
     # Create eval environment.
     eval_env = make_zermelo_eval_env(FLAGS.zermelo_config)

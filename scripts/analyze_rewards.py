@@ -677,7 +677,7 @@ def main(_):
     reward_cfg = cfg['reward']
     goal_reward = reward_cfg['goal_reward']
 
-    dataset_path = FLAGS.dataset or _find_latest_dataset(cfg['dataset']['save_path'])
+    dataset_path = FLAGS.dataset or _find_latest_dataset(cfg['run']['save_path'])
     print(f'Loading dataset: {dataset_path}')
     data = dict(np.load(dataset_path))
 

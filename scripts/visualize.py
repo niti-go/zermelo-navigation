@@ -19,7 +19,7 @@ import zermelo_env  # noqa: register envs
 from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 
 # --- Settings ---
-NUM_EPISODES = 5
+NUM_EPISODES = 3
 OUT_PATH = 'datasets/video.mp4'
 FPS = 30
 RENDER_SIZE = 400
@@ -98,7 +98,7 @@ def main():
             env.unwrapped.model.geom('target').pos[:2] = goal_xy_all[start]
         else:
             # Fallback for old datasets without goal_xy.
-            goal_xy = env.unwrapped.ij_to_xy(tuple(cfg['start_goal']['goal_ij']))
+            goal_xy = env.unwrapped.ij_to_xy(tuple(cfg['task']['fixed_goal_ij']))
             env.unwrapped.model.geom('target').pos[:2] = goal_xy
 
         ep_actions = actions[start:end] if actions is not None else None
