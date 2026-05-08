@@ -25,5 +25,6 @@ Thumbs.db
 # MuJoCo temp files
 *.xml.tmp
 
-/exp
-/datasets
+exp/
+datasets/
+debug/

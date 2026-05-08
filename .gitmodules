@@ -1,6 +1,3 @@
-[submodule "ext/ogbench"]
-	path = ext/ogbench
-	url = https://github.com/niti-go/ogbench.git
 [submodule "ext/MeanFlowQL"]
 	path = ext/MeanFlowQL
 	url = https://github.com/niti-go/MeanFlowQL.git

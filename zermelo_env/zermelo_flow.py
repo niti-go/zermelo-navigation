@@ -13,6 +13,10 @@ except ImportError:
 #this will be the default value if we don't provide an override in config
 MAX_FLOW_MAGNITUDE = 1.8  # Agent max displacement is 0.2/step; flow displacement = 0.1 * mag.
 
+# Process-wide cache for preloaded netcdf frames so multiple env instances in
+# the same process share one copy of the (multi-GB) array.
+_PRELOAD_CACHE = {}
+
 """
 To generate a flow field:
 python zermelo_env/zermelo_flow.py --name yellow_path
@@ -316,6 +320,45 @@ class DynamicNetCDFFlowField:
         self._slice_cache = {}
         self._cache_max = int(cfg.get('slice_cache_size', 4))
 
+        # Optional bulk preload: read every (u, v) frame into RAM once so
+        # _get_slice becomes a free array index. Costs ~2 * n_frames * nx * ny *
+        # 4 bytes (float32). For the 9-file HIT dataset that's ~18 GB.
+        self._preloaded_u = None
+        self._preloaded_v = None
+        if bool(cfg.get('preload_all_frames', False)):
+            self._preload_all_frames()
+
+    def _preload_all_frames(self):
+        """Load every u/v frame across all files into one contiguous float32
+        array. After this, _get_slice indexes RAM instead of reading disk.
+
+        Cached process-wide so multiple env instances share one copy.
+        """
+        total = self._n_frames_total
+        nx, ny = self._nx, self._ny
+        cache_key = (total, nx, ny, tuple(self._frames_per_file.tolist()))
+        cached = _PRELOAD_CACHE.get(cache_key)
+        if cached is not None:
+            self._preloaded_u, self._preloaded_v = cached
+            print('  [DynamicNetCDFFlowField] preload reused from cache.')
+            return
+        bytes_total = 2 * total * nx * ny * 4
+        print(
+            f'  [DynamicNetCDFFlowField] preloading {total} frames '
+            f'({nx}x{ny}, ~{bytes_total / 1e9:.1f} GB) into RAM...'
+        )
+        u_full = np.empty((total, nx, ny), dtype=np.float32)
+        v_full = np.empty((total, nx, ny), dtype=np.float32)
+        for file_i, ds in enumerate(self._datasets):
+            start = int(self._file_offsets[file_i])
+            end = int(self._file_offsets[file_i + 1])
+            u_full[start:end] = ds['u'].values.astype(np.float32, copy=False)
+            v_full[start:end] = ds['v'].values.astype(np.float32, copy=False)
+        self._preloaded_u = u_full
+        self._preloaded_v = v_full
+        _PRELOAD_CACHE[cache_key] = (u_full, v_full)
+        print('  [DynamicNetCDFFlowField] preload complete.')
+
     def _native_time(self, t):
         """Convert arena time (seconds) to a continuous native frame index in [0, n_frames).
 
@@ -362,14 +405,16 @@ class DynamicNetCDFFlowField:
     def _get_slice(self, idx):
         """Load u/v arrays for global frame idx (periodic in T), cached."""
         idx = int(idx) % self._n_frames_total
+        if self._preloaded_u is not None:
+            return self._preloaded_u[idx], self._preloaded_v[idx]
         if idx in self._slice_cache:
             return self._slice_cache[idx]
         # Route the global frame index to the right file + local index.
         file_i = int(np.searchsorted(self._file_offsets, idx, side='right') - 1)
         local_idx = idx - int(self._file_offsets[file_i])
         ds = self._datasets[file_i]
-        u = ds['u'].isel(time=local_idx).values.astype(np.float64)
-        v = ds['v'].isel(time=local_idx).values.astype(np.float64)
+        u = ds['u'].isel(time=local_idx).values.astype(np.float32)
+        v = ds['v'].isel(time=local_idx).values.astype(np.float32)
         if len(self._slice_cache) >= self._cache_max:
             self._slice_cache.pop(next(iter(self._slice_cache)))
         self._slice_cache[idx] = (u, v)

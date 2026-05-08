@@ -34,7 +34,7 @@ CUDA_VISIBLE_DEVICES=4 python ~/zermelo-navigation/experiments/zermelo/meanflowq
     --save_interval=50000 \
     --agent.alpha=2000 \
     --agent.num_candidates=5 \
-    --proj_wandb=zermelo_hit_dynamic \
+    --proj_wandb=zermelo_hit_dynamic_poordataset \
     --run_group=meanflowql \
     --wandb_online=True
 

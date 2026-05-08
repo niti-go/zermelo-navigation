@@ -35,7 +35,7 @@ wandb login
 CUDA_VISIBLE_DEVICES=7 python ~/zermelo-navigation/experiments/zermelo/dt_zermelo.py \
     --train_steps=500000 \
     --seed=0 \
-    --proj_wandb=zermelo_hit_dynamic \
+    --proj_wandb=zermelo_hit_dynamic_poordataset\
     --run_group=dt \
     --wandb_online=True
 

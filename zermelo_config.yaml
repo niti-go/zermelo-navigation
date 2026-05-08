@@ -6,6 +6,13 @@
 # Both the environment (ZermeloMazeEnv) and the data
 # generation script (generate_zermelo.py) read from this file.
 
+# --- System ----------------------------------------------------------------
+system:
+  high_ram_memory: true             # true: preload entire netcdf flow into RAM
+                                    # (~19 GB for the HIT dataset) for fast lookups.
+                                    # false: stream from disk with a small LRU
+                                    # cache (slower, but works on small machines).
+
 # --- Maze / arena layout ---------------------------------------------------
 maze:
   enabled: false                  # true = internal walls, false = open arena (boundary only)

@@ -1,0 +1,154 @@
+# =============================================================================
+# Zermelo Navigation Env — Master Configuration
+# =============================================================================
+# Single source of truth for zermelo env physics + offline dataset generation + training algos.
+#
+# Both the environment (ZermeloMazeEnv) and the data
+# generation script (generate_zermelo.py) read from this file.
+
+# --- System ----------------------------------------------------------------
+system:
+  high_ram_memory: true             # true: preload entire netcdf flow into RAM
+                                    # (~19 GB for the HIT dataset) for fast lookups.
+                                    # false: stream from disk with a small LRU
+                                    # cache (slower, but works on small machines).
+
+# --- Maze / arena layout ---------------------------------------------------
+maze:
+  enabled: false                  # true = internal walls, false = open arena (boundary only)
+  map:                            # 2-D grid: 1 = wall, 0 = free.  Ignored when maze.enabled = false.
+    - [1, 1, 1, 1, 1, 1, 1, 1]
+    - [1, 0, 0, 1, 1, 0, 0, 1]
+    - [1, 0, 0, 1, 0, 0, 0, 1]
+    - [1, 1, 0, 0, 0, 1, 1, 1]
+    - [1, 0, 0, 1, 0, 0, 0, 1]
+    - [1, 0, 1, 0, 0, 1, 0, 1]
+    - [1, 0, 0, 0, 1, 0, 0, 1]
+    - [1, 1, 1, 1, 1, 1, 1, 1]
+  unit: 4.0                       # size of one grid cell in continuous coords
+  height: 0.5                     # wall height (fraction of unit)
+
+# --- Flow field -------------------------------------------------------------
+# `mode` selects which type of field is used.
+#   static  — read a precomputed (.npy/.npz) field from `static.path`
+#   tgv     — analytic Taylor-Green vortex (NS-exact when omega/Ux/Uy=0)
+#   netcdf  — load (u,v,time,x,y) from a NetCDF file or directory
+flow:
+  mode: netcdf                    # "static" | "tgv" | "netcdf"
+
+  # -- shared spatial domain (used by all dynamic modes) --------------------
+  # Must match the arena. Keep x_range == y_range for divergence-free flow.
+  x_range: [-4.0, 24.0]
+  y_range: [-4.0, 24.0]
+
+  # -- mode: static ---------------------------------------------------------
+  static:
+    path: zermelo_env/assets/yellow_path_field.npz
+    # other built-in options:
+    #   zermelo_env/assets/taylor_green_field.npz
+    # Generate a custom one with:
+    #   python zermelo_env/zermelo_flow.py --name taylor_green
+
+  # -- mode: tgv ------------------------------------------------------------
+  tgv:
+    amplitude: 1.8                # peak velocity magnitude at t=0
+    nu: 0.2                       # viscosity (decay rate); 0 = no decay
+    omega: 0.0                    # oscillation frequency (rad/s); 0 = none
+    Ux: 0.0                       # vortex pattern drift speed in x
+    Uy: 0.0                       # vortex pattern drift speed in y
+    n_vortices: 2                 # number of full vortex wavelengths per dim
+    # Note: nonzero omega/Ux/Uy break the NS-exact property.
+
+  # -- mode: netcdf ---------------------------------------------------------
+  netcdf:
+    # Either a directory of .nc files (chained in numeric-suffix order),
+    # an explicit list, or a single file. All files must share (x, y) grid.
+    nc_dir: datasets/hit_flow
+    # nc_paths: [...]
+    # nc_path: path.nc
+    frames_per_step: 3            # HIT snapshots advanced per env step. can use to speed up the dynamics
+    target_max: 2.3               # rescale velocities to this peak magnitude
+                                  # (agent-overcome threshold ~ 2*sqrt(2) ≈ 2.83)
+    slice_cache_size: 4           # how many (T,X,Y) frames to keep in RAM
+    n_tiles: 1.0                  # native-box copies tiling the arena
+                                  # (1 = one big copy; 2 = 2x2 tiling, etc.)
+
+# --- Observation ------------------------------------------------------------
+observation:
+  type: states                    # "states" or "pixels"
+  include_flow: true              # append local flow vector to state obs
+
+# --- Misc env behavior ------------------------------------------------------
+env:
+  terminate_at_goal: true         # end the episode when goal is reached
+  goal_tolerance: 1.0             # xy-distance to count as "reached"
+  show_action_arrow: true         # draw an arrow on the agent showing the last action
+
+
+task:
+  start_goal_mode: random         # "random" | "fixed"
+  fixed_start_ij: [6, 1]          # used when start_goal_mode = "fixed"
+  fixed_goal_ij:  [1, 6]
+  noise_on_reset: true            # jitter both start and goal slightly each reset
+
+
+# route — which path the demonstrator takes. Controls trajectory diversity
+# WITHOUT affecting how skillful the demonstrator is.
+route:
+  waypoints: [1, 4]               # [min, max] inclusive — random intermediates per episode
+                                  # [0, 0] = always direct path
+  detour_budget: 4             # max (path-via-waypoints / direct-path) ratio.
+                                  # Same semantics in maze (BFS cell counts) and
+                                  # open arena (Euclidean distance).
+  waypoint_tolerance: 2.0         # xy-distance to "reach" a waypoint
+  waypoint_step_budget: 0.4       # fraction of max_episode_steps allowed per waypoint
+                                  # before skipping to the next (auto-scales with episode length)
+
+
+# agent personality — how the demonstrator executes the route.
+#
+# Three independent personality dimensions
+#   noise    — Gaussian std added to each action component. 0.0 = clean,
+#              0.4 = very jittery. Action is clipped to [-1, 1].
+#   inertia  — heading EMA smoothing. 0.0 = snap directly to subgoal each step
+#              (twitchy), 1.0 = never update heading (frozen). 0.9+ feels smooth.
+#   speed    — magnitude of the directed action component. 1.0 = full throttle.
+#
+#
+# `drift` is orthogonal: how much each dimension random-walks WITHIN an episode.
+#   0.0 = fixed for the whole episode; 1.0 = walks across its full range.
+agent:
+  noise:   [0.00, 0.02]           # [min, max] — Gaussian action noise
+  inertia: [0.4, 0.95]           # [min, max] — heading EMA smoothing
+  speed:   [0.0, 1.0]            # [min, max] — directed action magnitude
+  drift: 0.0                      # in [0, 1] — within-episode variation
+
+
+# offline dataset generation logistics
+run:
+  seed: 0
+  num_episodes: 20000
+  max_episode_steps: 1000
+  save_path: datasets/zermelo_hit_poor_quality_20000.npz   # run from repo root
+
+
+# reward — weights for the per-step reward function. These are baked into
+# `data['rewards']` at dataset-generation time AND used by the env at
+# training/eval time. Training scripts (bc, dt, meanflowql) train directly
+# on `data['rewards']`
+#
+# To change weights AFTER a dataset has been generated without regenerating,
+# run:
+#   python scripts/recompute_rewards.py \
+#       --energy_weight=... --time_weight=... --distance_weight=...
+# That script overwrites `data['rewards']` in place using the per-step
+# reward components stored alongside it.
+#
+# `drift_threshold` is logging-only (action norm below this counts as
+# "drifting" in the printed summary; it does not affect the reward).
+reward:
+  goal_reward: 100.0
+  energy_weight: 0.08
+  time_weight: 0.13
+  distance_weight: 0.009
+  drift_threshold: 0.0

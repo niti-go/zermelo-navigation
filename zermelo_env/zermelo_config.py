@@ -58,10 +58,11 @@ def get_flow_runtime(cfg):
     .npy/.npz path when mode='static', else None.
     """
     flow_cfg = cfg['flow']
-    return _build_dynamic_flow_cfg(flow_cfg), _static_flow_path(flow_cfg)
+    high_ram = bool(cfg.get('system', {}).get('high_ram_memory', False))
+    return _build_dynamic_flow_cfg(flow_cfg, high_ram), _static_flow_path(flow_cfg)
 
 
-def _build_dynamic_flow_cfg(flow_cfg):
+def _build_dynamic_flow_cfg(flow_cfg, high_ram_memory=False):
     """Translate the user-facing `flow.mode` switch into the legacy
     dynamic_flow_cfg dict that ZermeloMazeEnv / ZermeloPointEnv consume.
 
@@ -81,7 +82,11 @@ def _build_dynamic_flow_cfg(flow_cfg):
     if mode == 'tgv':
         out.update(flow_cfg.get('tgv', {}))
     elif mode == 'netcdf':
-        out['netcdf'] = flow_cfg.get('netcdf', {})
+        netcdf_cfg = dict(flow_cfg.get('netcdf', {}))
+        # Honor the system-wide high-RAM flag unless the netcdf block sets
+        # preload_all_frames explicitly.
+        netcdf_cfg.setdefault('preload_all_frames', bool(high_ram_memory))
+        out['netcdf'] = netcdf_cfg
     else:
         raise ValueError(f"flow.mode must be one of 'static', 'tgv', 'netcdf'; got {mode!r}")
     return out
@@ -99,7 +104,8 @@ def config_to_env_kwargs(cfg):
     maze_map = cfg['maze']['map'] if cfg['maze']['enabled'] else None
 
     flow_cfg = cfg['flow']
-    dynamic_flow_cfg = _build_dynamic_flow_cfg(flow_cfg)
+    high_ram = bool(cfg.get('system', {}).get('high_ram_memory', False))
+    dynamic_flow_cfg = _build_dynamic_flow_cfg(flow_cfg, high_ram)
     flow_field_path = _static_flow_path(flow_cfg)
 
     task_cfg = cfg['task']
