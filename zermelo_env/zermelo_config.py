@@ -12,7 +12,7 @@ import yaml
 
 # Path to the default config shipped with the repo.
 _DEFAULT_CONFIG_PATH = os.path.join(
-    os.path.dirname(__file__), '..', 'configs', 'zermelo_config.yaml',
+    os.path.dirname(__file__), '..', 'zermelo_config.yaml',
 )
 
 
@@ -48,65 +48,40 @@ def load_config(config_path=None):
     return cfg
 
 
-def get_flow_runtime(cfg):
-    """Public helper: return (dynamic_flow_cfg, static_flow_path) from a loaded
-    config. Other scripts (visualize, evaluate_models) use this instead of
-    poking at cfg['flow'] directly so the schema stays in one place.
+def build_hit_flow_cfg(cfg, max_file=None):
+    """Translate the YAML `flow` block into kwargs for HITChainFlow.
 
-    `dynamic_flow_cfg` has the legacy {'enabled': bool, 'mode': ..., ...} shape
-    that the env / DynamicFlowField classes consume. `static_flow_path` is the
-    .npy/.npz path when mode='static', else None.
+    `max_file` overrides `flow.max_file` (use this in dataset generators to
+    restrict to the train segment, e.g. max_file=45). The env itself does
+    NOT apply a max_file by default; eval / replay code can query any
+    available frame.
     """
     flow_cfg = cfg['flow']
-    high_ram = bool(cfg.get('system', {}).get('high_ram_memory', False))
-    return _build_dynamic_flow_cfg(flow_cfg, high_ram), _static_flow_path(flow_cfg)
-
-
-def _build_dynamic_flow_cfg(flow_cfg, high_ram_memory=False):
-    """Translate the user-facing `flow.mode` switch into the legacy
-    dynamic_flow_cfg dict that ZermeloMazeEnv / ZermeloPointEnv consume.
-
-    The env code expects: {'enabled': bool, 'mode': 'tgv'|'netcdf', ...params,
-    'x_range': [...], 'y_range': [...]}.
-    """
-    mode = flow_cfg.get('mode', 'static')
-    if mode == 'static':
-        return {'enabled': False}
+    nc_dir = flow_cfg['nc_dir']
+    if not os.path.isabs(nc_dir):
+        # Resolve relative paths against the repo root.
+        repo_root = os.path.dirname(_DEFAULT_CONFIG_PATH)
+        nc_dir = os.path.abspath(os.path.join(repo_root, nc_dir))
 
     out = {
-        'enabled': True,
-        'mode': mode,
+        'nc_dir': nc_dir,
         'x_range': flow_cfg.get('x_range', [-4.0, 24.0]),
         'y_range': flow_cfg.get('y_range', [-4.0, 24.0]),
+        'n_tiles': flow_cfg.get('n_tiles', 1.0),
+        'target_max': flow_cfg.get('target_max', None),
+        'frames_per_step': float(flow_cfg.get('frames_per_step', 1.0)),
     }
-    if mode == 'tgv':
-        out.update(flow_cfg.get('tgv', {}))
-    elif mode == 'netcdf':
-        netcdf_cfg = dict(flow_cfg.get('netcdf', {}))
-        # Honor the system-wide high-RAM flag unless the netcdf block sets
-        # preload_all_frames explicitly.
-        netcdf_cfg.setdefault('preload_all_frames', bool(high_ram_memory))
-        out['netcdf'] = netcdf_cfg
-    else:
-        raise ValueError(f"flow.mode must be one of 'static', 'tgv', 'netcdf'; got {mode!r}")
+    chosen_max = max_file if max_file is not None else flow_cfg.get('max_file', None)
+    if chosen_max is not None:
+        out['max_file'] = int(chosen_max)
     return out
 
 
-def _static_flow_path(flow_cfg):
-    """Return the static .npy/.npz path, or None if a dynamic mode is active."""
-    if flow_cfg.get('mode', 'static') != 'static':
-        return None
-    return flow_cfg.get('static', {}).get('path')
-
-
-def config_to_env_kwargs(cfg):
+def config_to_env_kwargs(cfg, max_file=None):
     """Extract the kwargs that ZermeloMazeEnv.__init__ expects from a config dict."""
     maze_map = cfg['maze']['map'] if cfg['maze']['enabled'] else None
 
-    flow_cfg = cfg['flow']
-    high_ram = bool(cfg.get('system', {}).get('high_ram_memory', False))
-    dynamic_flow_cfg = _build_dynamic_flow_cfg(flow_cfg, high_ram)
-    flow_field_path = _static_flow_path(flow_cfg)
+    hit_flow_cfg = build_hit_flow_cfg(cfg, max_file=max_file)
 
     task_cfg = cfg['task']
     reward_cfg = cfg['reward']
@@ -116,8 +91,7 @@ def config_to_env_kwargs(cfg):
         maze_height=cfg['maze']['height'],
         maze_on=cfg['maze']['enabled'],
         maze_map_override=maze_map,
-        flow_field_path=flow_field_path,
-        dynamic_flow_cfg=dynamic_flow_cfg,
+        hit_flow_cfg=hit_flow_cfg,
         fixed_start_goal=(task_cfg['start_goal_mode'] == 'fixed'),
         fixed_init_ij=tuple(task_cfg['fixed_start_ij']),
         fixed_goal_ij=tuple(task_cfg['fixed_goal_ij']),
@@ -132,6 +106,7 @@ def config_to_env_kwargs(cfg):
         include_flow_in_obs=cfg['observation']['include_flow'],
         terminate_at_goal=cfg['env']['terminate_at_goal'],
         goal_tolerance=cfg['env']['goal_tolerance'],
+        action_scale=cfg['env'].get('action_scale', 2.0),
         add_noise_to_goal=task_cfg['noise_on_reset'],
         add_noise_to_start=task_cfg['noise_on_reset'],
         show_action_arrow=cfg['env'].get('show_action_arrow', False),

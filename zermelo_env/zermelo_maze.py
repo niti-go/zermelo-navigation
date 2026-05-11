@@ -6,11 +6,7 @@ import mujoco
 import numpy as np
 from gymnasium.spaces import Box
 
-from zermelo_env.zermelo_flow import (
-    DynamicNetCDFFlowField,
-    DynamicTGVFlowField,
-    FlowField,
-)
+from zermelo_env.hit_chain import HITChainFlow
 from zermelo_env.zermelo_point import ZermeloPointEnv
 
 
@@ -49,9 +45,8 @@ def make_zermelo_maze_env(*args, **kwargs):
             add_noise_to_start=True,
             reward_task_id=None,
             use_oracle_rep=False,
-            flow_field_path=None,
+            hit_flow_cfg=None,
             include_flow_in_obs=True,
-            dynamic_flow_cfg=None,
             fixed_start_goal=False,
             fixed_init_ij=(6, 1),
             fixed_goal_ij=(1, 6),
@@ -102,20 +97,12 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._goal_tol = goal_tolerance
 
             # Load flow field early for arrow visualization.
-            self._dynamic_flow_cfg = dynamic_flow_cfg or {}
-            if self._dynamic_flow_cfg.get('enabled', False):
-                mode = self._dynamic_flow_cfg.get('mode', 'tgv')
-                if mode == 'netcdf':
-                    self._flow_for_arrows = DynamicNetCDFFlowField(
-                        self._dynamic_flow_cfg.get('netcdf', {}) | {
-                            'x_range': self._dynamic_flow_cfg.get('x_range', [-4.0, 24.0]),
-                            'y_range': self._dynamic_flow_cfg.get('y_range', [-4.0, 24.0]),
-                        }
-                    )
-                else:
-                    self._flow_for_arrows = DynamicTGVFlowField(self._dynamic_flow_cfg)
-            else:
-                self._flow_for_arrows = FlowField(flow_field_path)
+            if hit_flow_cfg is None:
+                raise ValueError('hit_flow_cfg is required.')
+            self._hit_flow_cfg = dict(hit_flow_cfg)
+            arrow_cfg = dict(self._hit_flow_cfg)
+            arrow_cfg.pop('frames_per_step', None)
+            self._flow_for_arrows = HITChainFlow(**arrow_cfg)
 
             # --- Build maze map ---
             if maze_map_override is not None:
@@ -166,9 +153,8 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             super().__init__(
                 xml_file=maze_xml_file,
-                flow_field_path=flow_field_path,
+                hit_flow_cfg=self._hit_flow_cfg,
                 include_flow_in_obs=include_flow_in_obs,
-                dynamic_flow_cfg=dynamic_flow_cfg,
                 *args,
                 **kwargs,
             )
@@ -255,7 +241,7 @@ def make_zermelo_maze_env(*args, **kwargs):
                             for dy in offsets:
                                 x = cx + dx
                                 y = cy + dy
-                                flow_vx, flow_vy = self._flow_for_arrows.get_flow(x, y)
+                                flow_vx, flow_vy = self._flow_for_arrows.get_flow(x, y, 0.0)
                                 mag = math.sqrt(flow_vx ** 2 + flow_vy ** 2)
                                 if mag < 1e-6:
                                     continue
@@ -343,17 +329,11 @@ def make_zermelo_maze_env(*args, **kwargs):
                     conaffinity='0',
                 )
 
-        def update_flow_arrows(self, t=0.0):
-            """Update MuJoCo arrow geoms to reflect the flow field at time *t*.
-
-            Only meaningful when the dynamic flow is active; with a static
-            field the arrows never change, so calling this is a no-op.
-            """
-            if not self._dynamic_flow_cfg.get('enabled', False):
-                return
+        def update_flow_arrows(self, frame=0.0):
+            """Update MuJoCo arrow geoms to reflect the flow field at `frame`."""
             arrow_width = 0.08
             for arrow_idx, x, y in self._arrow_positions:
-                flow_vx, flow_vy = self._flow_for_arrows.get_flow(x, y, t)
+                flow_vx, flow_vy = self._flow_for_arrows.get_flow(x, y, frame)
                 mag = math.sqrt(flow_vx ** 2 + flow_vy ** 2)
 
                 if mag < 1e-6:
@@ -449,6 +429,9 @@ def make_zermelo_maze_env(*args, **kwargs):
                 self.cur_task_info = dict(init_ij=init_ij, goal_ij=goal_ij)
 
             render_goal = options.get('render_goal', False)
+
+            # Pin the flow-clock start for this episode.
+            self.set_start_frame(float(options.get('start_frame', 0.0)))
 
             init_xy = self.ij_to_xy(self.cur_task_info['init_ij'])
             if self._add_noise_to_start:
@@ -569,9 +552,8 @@ def make_zermelo_maze_env(*args, **kwargs):
         def render(self):
             if self.custom_renderer is None:
                 self.initialize_renderer()
-            # Refresh flow arrows so dynamic fields evolve in the rendered video.
-            # Static fields short-circuit inside update_flow_arrows.
-            self.update_flow_arrows(getattr(self, '_sim_time', 0.0))
+            # Refresh flow arrows so the field evolves in the rendered video.
+            self.update_flow_arrows(getattr(self, '_frame', 0.0))
             self._update_action_arrow()
             self.custom_renderer.update_scene(self.data, camera=self.custom_camera)
             return self.custom_renderer.render()

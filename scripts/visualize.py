@@ -18,6 +18,8 @@ import numpy as np
 import zermelo_env  # noqa: register envs
 from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 
+DEFAULT_REPLAY_FRAME = 0.0
+
 # --- Settings ---
 NUM_EPISODES = 3
 OUT_PATH = 'datasets/video.mp4'
@@ -50,12 +52,15 @@ def find_episode_boundaries(terminals):
     return episodes
 
 
-def replay_episode(env, qpos_array, actions_array=None):
-    dt = env.unwrapped.frame_skip * env.unwrapped.model.opt.timestep
+def replay_episode(env, qpos_array, actions_array=None, frame_array=None):
+    fps = env.unwrapped.frames_per_step
     frames = []
     for t in range(len(qpos_array)):
-        # Set the env's sim clock so render() draws the flow at this episode time.
-        env.unwrapped._sim_time = t * dt
+        if frame_array is not None and t < len(frame_array):
+            f = float(frame_array[t])
+        else:
+            f = t * fps  # legacy datasets without a per-step `frame` field.
+        env.unwrapped.set_frame(f)
         env.unwrapped.data.qpos[:] = qpos_array[t]
         if actions_array is not None and t < len(actions_array):
             env.unwrapped._last_action = np.asarray(actions_array[t], dtype=np.float64)
@@ -74,6 +79,7 @@ def main():
     qpos = data['qpos']
     actions = data['actions'] if 'actions' in data.files else None
     goal_xy_all = data.get('goal_xy', None)
+    frame_all = data['frame'] if 'frame' in data.files else None
 
     episodes = find_episode_boundaries(terminals)
     print(f'{len(episodes)} episodes, {len(terminals)} total steps.')
@@ -102,7 +108,9 @@ def main():
             env.unwrapped.model.geom('target').pos[:2] = goal_xy
 
         ep_actions = actions[start:end] if actions is not None else None
-        frames = replay_episode(env, qpos[start:end], actions_array=ep_actions)
+        ep_frames = frame_all[start:end] if frame_all is not None else None
+        frames = replay_episode(env, qpos[start:end], actions_array=ep_actions,
+                                frame_array=ep_frames)
         all_frames.extend(frames)
         # Brief black gap between episodes.
         if idx != chosen[-1]:

@@ -6,13 +6,6 @@
 # Both the environment (ZermeloMazeEnv) and the data
 # generation script (generate_zermelo.py) read from this file.
 
-# --- System ----------------------------------------------------------------
-system:
-  high_ram_memory: true             # true: preload entire netcdf flow into RAM
-                                    # (~19 GB for the HIT dataset) for fast lookups.
-                                    # false: stream from disk with a small LRU
-                                    # cache (slower, but works on small machines).
-
 # --- Maze / arena layout ---------------------------------------------------
 maze:
   enabled: false                  # true = internal walls, false = open arena (boundary only)
@@ -29,49 +22,35 @@ maze:
   height: 0.5                     # wall height (fraction of unit)
 
 # --- Flow field -------------------------------------------------------------
-# `mode` selects which type of field is used.
-#   static  — read a precomputed (.npy/.npz) field from `static.path`
-#   tgv     — analytic Taylor-Green vortex (NS-exact when omega/Ux/Uy=0)
-#   netcdf  — load (u,v,time,x,y) from a NetCDF file or directory
+# Single source: a chain of HIT NetCDF snapshots (HIT1.nc, HIT2.nc, ...).
+# The chain is treated as one continuous clip; the env steps in *frame*
+# coords, advancing by `frames_per_step` snapshots per env step.
+#
+# Train/test split:
+#   - dataset generators restrict queries to HIT1..HIT{train_max_file}.
+#   - HIT{train_max_file+1}..HIT49 are reserved for held-out evaluation.
 flow:
-  mode: netcdf                    # "static" | "tgv" | "netcdf"
-
-  # -- shared spatial domain (used by all dynamic modes) --------------------
-  # Must match the arena. Keep x_range == y_range for divergence-free flow.
-  x_range: [-4.0, 24.0]
+  nc_dir: datasets                # directory containing HIT1 - HIT49.nc
+  x_range: [-4.0, 24.0]           # arena spatial extent (must match maze)
   y_range: [-4.0, 24.0]
-
-  # -- mode: static ---------------------------------------------------------
-  static:
-    path: zermelo_env/assets/yellow_path_field.npz
-    # other built-in options:
-    #   zermelo_env/assets/taylor_green_field.npz
-    # Generate a custom one with:
-    #   python zermelo_env/zermelo_flow.py --name taylor_green
-
-  # -- mode: tgv ------------------------------------------------------------
-  tgv:
-    amplitude: 1.8                # peak velocity magnitude at t=0
-    nu: 0.2                       # viscosity (decay rate); 0 = no decay
-    omega: 0.0                    # oscillation frequency (rad/s); 0 = none
-    Ux: 0.0                       # vortex pattern drift speed in x
-    Uy: 0.0                       # vortex pattern drift speed in y
-    n_vortices: 2                 # number of full vortex wavelengths per dim
-    # Note: nonzero omega/Ux/Uy break the NS-exact property.
-
-  # -- mode: netcdf ---------------------------------------------------------
-  netcdf:
-    # Either a directory of .nc files (chained in numeric-suffix order),
-    # an explicit list, or a single file. All files must share (x, y) grid.
-    nc_dir: datasets/hit_flow
-    # nc_paths: [...]
-    # nc_path: path.nc
-    frames_per_step: 3            # HIT snapshots advanced per env step. can use to speed up the dynamics
-    target_max: 2.3               # rescale velocities to this peak magnitude
+  frames_per_step: 5              # HIT snapshots advanced per env step
+  target_max: 2.3                 # rescale velocities to this peak magnitude
                                   # (agent-overcome threshold ~ 2*sqrt(2) ≈ 2.83)
-    slice_cache_size: 4           # how many (T,X,Y) frames to keep in RAM
-    n_tiles: 1.0                  # native-box copies tiling the arena
+  n_tiles: 1.0                    # native-box copies tiling the arena
                                   # (1 = one big copy; 2 = 2x2 tiling, etc.)
+  train_max_file: 45              # generators query only HIT1..HIT{this}
+  # max_file: 49                  # optional global cap (env default = all files)
+  start_frame_mode: deterministic_spread
+                                  # "deterministic_spread" — episode i in
+                                  # [0, num_episodes) starts at
+                                  # i * (n_train_frames - episode_span) /
+                                  #     (num_episodes - 1)
+                                  # giving a uniform sweep across the train
+                                  # segment. Adjacent episodes overlap when
+                                  # num_episodes > n_train_frames / span,
+                                  # but coverage is uniform.
+                                  # "random" — legacy: each episode samples a
+                                  # start_frame uniformly in the valid range.
 
 # --- Observation ------------------------------------------------------------
 observation:
@@ -83,6 +62,10 @@ env:
   terminate_at_goal: true         # end the episode when goal is reached
   goal_tolerance: 1.0             # xy-distance to count as "reached"
   show_action_arrow: true         # draw an arrow on the agent showing the last action
+  action_scale: 1.3               # per-axis multiplier from action ∈ [-1, 1] to
+                                  # agent velocity. Max agent speed = action_scale
+                                  # * sqrt(2). Default 2.0 → ~2.83 w.u./s, on par
+                                  # with the flow peak set by flow.target_max.
 
 
 task:
@@ -127,9 +110,9 @@ agent:
 # offline dataset generation logistics
 run:
   seed: 0
-  num_episodes: 20000
+  num_episodes: 10
   max_episode_steps: 1000
-  save_path: datasets/zermelo_hit_poor_quality_20000.npz   # run from repo root
+  save_path: datasets/small_generalized_flow_dataset.npz   # run from repo root
 
 
 # reward — weights for the per-step reward function. These are baked into
@@ -148,7 +131,7 @@ run:
 # "drifting" in the printed summary; it does not affect the reward).
 reward:
   goal_reward: 100.0
-  energy_weight: 0.08
-  time_weight: 0.13
+  energy_weight: 0.3
+  time_weight: 0
   distance_weight: 0.009
   drift_threshold: 0.0

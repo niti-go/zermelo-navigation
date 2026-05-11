@@ -1,73 +1,65 @@
-import os
-
 import mujoco
 import numpy as np
 
 from zermelo_env.point import PointEnv
-from zermelo_env.zermelo_flow import (
-    DynamicNetCDFFlowField,
-    DynamicTGVFlowField,
-    FlowField,
-)
+from zermelo_env.hit_chain import HITChainFlow
 
 
 class ZermeloPointEnv(PointEnv):
-    """Point mass environment with a background fluid flow field (Zermelo navigation).
+    """Point mass environment with a chained-HIT background flow field.
 
-    The flow field adds a displacement to the agent's position at each step,
-    simulating navigation through a fluid. The field can be either:
-      - Static: loaded from an .npy/.npz file (default).
-      - Dynamic: an analytically computed, time-varying Taylor-Green vortex
-        controlled via ``dynamic_flow_cfg``.
+    The flow advances in *frame* coordinates: each env step advances the
+    internal frame counter by ``frames_per_step`` (which may be fractional).
+    The flow at any continuous frame index is provided by ``HITChainFlow``.
+
+    Episode reset can override the starting frame via
+    ``reset(options={'start_frame': F})``; otherwise the episode begins at
+    frame 0.
     """
 
-    def __init__(self, flow_field_path=None, include_flow_in_obs=True,
-                 dynamic_flow_cfg=None, **kwargs):
-        self._flow_field_path = flow_field_path
+    def __init__(self, hit_flow_cfg, include_flow_in_obs=True,
+                 action_scale=2.0, **kwargs):
+        cfg = dict(hit_flow_cfg)
+        self._frames_per_step = float(cfg.pop('frames_per_step', 1.0))
+        self._flow_field = HITChainFlow(**cfg)
         self._include_flow_in_obs = include_flow_in_obs
+        # Per-axis multiplier from raw action ∈ [-1, 1] to agent velocity in
+        # world units. With action_scale = 2 the agent's max speed is
+        # 2*sqrt(2) ≈ 2.83 w.u./s, comparable to the flow's peak.
+        self._action_scale = float(action_scale)
 
-        # Decide between static file-based flow and dynamic analytic flow.
-        self._dynamic_flow_cfg = dynamic_flow_cfg or {}
-        self._use_dynamic_flow = self._dynamic_flow_cfg.get('enabled', False)
-
-        if self._use_dynamic_flow:
-            mode = self._dynamic_flow_cfg.get('mode', 'tgv')
-            if mode == 'netcdf':
-                self._flow_field = DynamicNetCDFFlowField(
-                    self._dynamic_flow_cfg.get('netcdf', {}) | {
-                        'x_range': self._dynamic_flow_cfg.get('x_range', [-4.0, 24.0]),
-                        'y_range': self._dynamic_flow_cfg.get('y_range', [-4.0, 24.0]),
-                    }
-                )
-            else:
-                self._flow_field = DynamicTGVFlowField(self._dynamic_flow_cfg)
-        else:
-            self._flow_field = FlowField(flow_field_path)
-
-        # Simulation time — reset to 0 each episode.
-        self._sim_time = 0.0
+        # Continuous frame index of the *current* env state.
+        self._frame = 0.0
+        # Frame index at the start of the current episode.
+        self._start_frame = 0.0
 
         super().__init__(**kwargs)
-        # Note: observation_space is NOT updated here. The parent PointEnv sets a
-        # placeholder (6,) for MuJoCo init, and the maze wrapper (ZermeloMazeEnv)
-        # overrides it to match get_ob()'s actual output shape after construction.
-        # This mirrors how the original MazeEnv works with PointEnv.
+
+    @property
+    def frame(self):
+        return self._frame
+
+    @property
+    def frames_per_step(self):
+        return self._frames_per_step
+
+    @property
+    def n_frames(self):
+        return self._flow_field.n_frames
 
     def step(self, action):
         prev_qpos = self.data.qpos.copy()
         prev_qvel = self.data.qvel.copy()
 
         # Both agent and flow contribute displacement = dt * velocity.
-        # Raw action ∈ [-1, 1]² is rescaled to an agent velocity with max speed
-        # 2*sqrt(2) ≈ 2.83 w.u./s, comparable to the flow's peak speed.
+        # Raw action ∈ [-1, 1]² is rescaled by self._action_scale to give an
+        # agent velocity comparable to the flow's peak speed.
         dt = self.frame_skip * self.model.opt.timestep
-        agent_vx, agent_vy = 2.0 * action[0], 2.0 * action[1]
+        agent_vx = self._action_scale * action[0]
+        agent_vy = self._action_scale * action[1]
 
         x, y = self.data.qpos[0], self.data.qpos[1]
-        if self._use_dynamic_flow:
-            flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._sim_time)
-        else:
-            flow_vx, flow_vy = self._flow_field.get_flow(x, y)
+        flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._frame)
 
         self.data.qpos[0] += dt * (agent_vx + flow_vx)
         self.data.qpos[1] += dt * (agent_vy + flow_vy)
@@ -76,8 +68,8 @@ class ZermeloPointEnv(PointEnv):
 
         mujoco.mj_step(self.model, self.data, nstep=self.frame_skip)
 
-        # Advance simulation clock.
-        self._sim_time += dt
+        # Advance the flow clock.
+        self._frame += self._frames_per_step
 
         qpos = self.data.qpos.flat.copy()
         qvel = self.data.qvel.flat.copy()
@@ -98,20 +90,26 @@ class ZermeloPointEnv(PointEnv):
                 'prev_qvel': prev_qvel,
                 'qpos': qpos,
                 'qvel': qvel,
+                'frame': float(self._frame),
             },
         )
 
     def reset_model(self):
-        self._sim_time = 0.0
+        self._frame = float(self._start_frame)
         return super().reset_model()
+
+    def set_start_frame(self, start_frame):
+        """Pin the next reset to begin at this flow-clock frame."""
+        self._start_frame = float(start_frame)
+
+    def set_frame(self, frame):
+        """Override the current flow-clock frame (used by replay/visualize)."""
+        self._frame = float(frame)
 
     def get_ob(self):
         base_ob = self.data.qpos.flat.copy()
         if self._include_flow_in_obs:
             x, y = self.data.qpos[0], self.data.qpos[1]
-            if self._use_dynamic_flow:
-                flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._sim_time)
-            else:
-                flow_vx, flow_vy = self._flow_field.get_flow(x, y)
+            flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._frame)
             return np.concatenate([base_ob, [flow_vx, flow_vy]])
         return base_ob

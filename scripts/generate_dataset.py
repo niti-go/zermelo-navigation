@@ -35,7 +35,7 @@ Usage:
 """
 import multiprocessing as mp
 import pathlib
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import gymnasium
 import numpy as np
@@ -47,14 +47,9 @@ from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 
 FLAGS = flags.FLAGS
 
-flags.DEFINE_string('config', None, 'Path to zermelo_config.yaml (optional; uses built-in defaults if omitted).')
-flags.DEFINE_integer('num_workers', 16,
-                     'Number of parallel worker processes. 1 = run serially in-process.')
 
-
-def bfs_reachable(maze_map, start_ij):
-    """Return BFS distance map from start_ij. Unreachable cells have value -1."""
-    from collections import deque
+def _bfs_distance_map(maze_map, start_ij):
+    """BFS distance map from start_ij. Unreachable cells = -1."""
     dist = np.full_like(maze_map, -1)
     dist[start_ij[0], start_ij[1]] = 0
     queue = deque([start_ij])
@@ -69,16 +64,12 @@ def bfs_reachable(maze_map, start_ij):
     return dist
 
 
-def precompute_bfs_cache(maze_map, all_cells):
-    """Pre-compute BFS distance maps from every free cell. Returns dict: cell -> dist_map."""
-    cache = {}
-    for cell in all_cells:
-        cache[cell] = bfs_reachable(maze_map, cell)
-    return cache
+def _precompute_bfs_cache(maze_map, all_cells):
+    return {cell: _bfs_distance_map(maze_map, cell) for cell in all_cells}
 
 
-def oracle_subgoal_from_cache(agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy):
-    """BFS oracle subgoal using pre-computed cache instead of recomputing BFS each step."""
+def _oracle_subgoal(agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy):
+    """Pick the adjacent free cell that minimizes BFS distance to target_ij."""
     agent_ij = xy_to_ij(agent_xy)
     bfs_map = bfs_cache[target_ij]
     best_ij = agent_ij
@@ -90,6 +81,10 @@ def oracle_subgoal_from_cache(agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij
                 and bfs_map[ni, nj] < bfs_map[best_ij[0], best_ij[1]]):
             best_ij = (ni, nj)
     return np.array(ij_to_xy(best_ij))
+
+flags.DEFINE_string('config', None, 'Path to zermelo_config.yaml (optional; uses built-in defaults if omitted).')
+flags.DEFINE_integer('num_workers', 16,
+                     'Number of parallel worker processes. 1 = run serially in-process.')
 
 
 def sample_waypoints_maze(all_cells, start_ij, goal_ij, n_target,
@@ -211,6 +206,22 @@ class AgentPersonality:
         return np.clip(action, -1, 1)
 
 
+def _sample_start_frame(env, cfg):
+    """Pick a per-episode flow start frame within the train segment.
+
+    Restricts to [0, n_train_frames - max_episode_steps * frames_per_step]
+    so a full-length episode never queries past the train cutoff (HIT
+    files beyond `flow.train_max_file` are reserved for held-out eval).
+    """
+    fps = float(env.unwrapped.frames_per_step)
+    max_steps = int(cfg['run']['max_episode_steps'])
+    n_train = int(env.unwrapped.n_frames)
+    upper = n_train - max_steps * fps
+    if upper <= 0:
+        return 0.0
+    return float(np.random.uniform(0.0, upper))
+
+
 def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
     """Run a single episode and return per-step data plus episode summary stats."""
     maze_enabled = cfg['maze']['enabled']
@@ -263,7 +274,11 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         drift=agent_cfg.get('drift', 0.0),
     )
 
-    ob, _ = env.reset(options=dict(task_info=dict(init_ij=init_ij, goal_ij=goal_ij)))
+    start_frame = _sample_start_frame(env, cfg)
+    ob, _ = env.reset(options=dict(
+        task_info=dict(init_ij=init_ij, goal_ij=goal_ij),
+        start_frame=start_frame,
+    ))
 
     ep_data = defaultdict(list)
     done = False
@@ -298,7 +313,7 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
 
         if maze_enabled:
             target_ij = xy_to_ij(current_target_xy)
-            subgoal_xy = oracle_subgoal_from_cache(
+            subgoal_xy = _oracle_subgoal(
                 agent_xy, target_ij, bfs_cache, maze_map, xy_to_ij, ij_to_xy)
         else:
             subgoal_xy = current_target_xy
@@ -333,6 +348,8 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         ep_data['masks'].append(0.0 if terminated else 1.0)
         ep_data['qpos'].append(info['prev_qpos'])
         ep_data['qvel'].append(info['prev_qvel'])
+        # Flow-clock frame at the *start* of this step (before advance).
+        ep_data['frame'].append(np.float64(info['frame'] - env.unwrapped.frames_per_step))
         ep_data['goal_xy'].append(np.array(env.unwrapped.cur_goal_xy))
         ep_data['dist_to_goal'].append(step_dist)
         ep_data['goal_reward_components'].append(step_goal_r)
@@ -359,9 +376,16 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
 def _build_env_and_caches(cfg):
     """Build env + per-worker BFS cache / xy bounds. Returned as a dict."""
     run_cfg = cfg['run']
-    env_kwargs = config_to_env_kwargs(cfg)
+    train_max = cfg['flow'].get('train_max_file')
+    env_kwargs = config_to_env_kwargs(cfg, max_file=train_max)
     env_kwargs['max_episode_steps'] = run_cfg['max_episode_steps']
     env = gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
+    # Prewarm OS page cache for HIT flow files. This generator samples
+    # start_frames uniformly across the train segment, so we can't bound
+    # the worker's frame range — touch everything. The data is read from
+    # the local-SSD cache (see zermelo_env.hit_cache), not NFS, and pages
+    # are shared across workers via the OS page cache.
+    env.unwrapped._flow_field.prewarm()
 
     maze_map = env.unwrapped.maze_map
     all_cells = [
@@ -372,7 +396,7 @@ def _build_env_and_caches(cfg):
     ]
 
     maze_enabled = cfg['maze']['enabled']
-    bfs_cache = precompute_bfs_cache(maze_map, all_cells) if maze_enabled else None
+    bfs_cache = _precompute_bfs_cache(maze_map, all_cells) if maze_enabled else None
 
     xy_bounds = None
     if not maze_enabled:
