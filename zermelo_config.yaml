@@ -133,5 +133,10 @@ reward:
   goal_reward: 100.0
   energy_weight: 0.3
   time_weight: 0
-  distance_weight: 0.009
+  progress_weight: 0.5            # potential-based shaping coefficient (Ng et
+                                  # al. 1999). Per-step reward = progress_weight
+                                  # * (prev_dist - curr_dist). Telescopes to
+                                  # progress_weight * (initial_dist - final_dist)
+                                  # over an episode — policy-invariant, unlike
+                                  # the previous raw -k*dist penalty.
   drift_threshold: 0.0

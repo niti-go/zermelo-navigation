@@ -56,7 +56,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             goal_reward=1.0,
             energy_weight=0.0,
             time_weight=0.0,
-            distance_weight=0.0,
+            progress_weight=0.0,
             drift_threshold=0.01,
             goal_tolerance=1.0,
             show_action_arrow=False,
@@ -82,7 +82,16 @@ def make_zermelo_maze_env(*args, **kwargs):
             self._goal_reward = goal_reward
             self._energy_weight = energy_weight
             self._time_weight = time_weight
-            self._distance_weight = distance_weight
+            # Potential-based shaping coefficient (Ng et al. 1999): the
+            # per-step reward is progress_weight * (prev_dist - curr_dist),
+            # which telescopes to progress_weight * (initial_dist - final_dist)
+            # over the episode and is therefore policy-invariant (unlike a
+            # raw -k*dist penalty).
+            self._progress_weight = progress_weight
+            # Previous-step distance to goal, used to compute the progress
+            # term. Reset to None on each episode and re-initialized lazily
+            # in step() so it works whether or not reset() was called.
+            self._prev_dist_to_goal = None
             self._drift_threshold = drift_threshold
             self._show_action_arrow = bool(show_action_arrow)
             self._last_action = np.zeros(2, dtype=np.float64)
@@ -454,6 +463,10 @@ def make_zermelo_maze_env(*args, **kwargs):
             ob, info = super().reset(*args, **kwargs)
             self.set_goal(goal_xy=goal_xy)
             self.set_xy(init_xy)
+            # Seed the progress-shaping baseline at the actual episode start
+            # so the first step's progress term measures movement from here.
+            self._prev_dist_to_goal = float(
+                np.linalg.norm(self.get_xy() - self.cur_goal_xy))
             ob = self.get_ob()
             info['goal'] = goal_ob
             if render_goal:
@@ -492,9 +505,19 @@ def make_zermelo_maze_env(*args, **kwargs):
             # Time cost: constant per-step penalty (every step costs time).
             reward -= self._time_weight
 
-            # Distance cost: per-step penalty proportional to distance from goal.
+            # Progress reward: potential-based shaping with Phi = -dist_to_goal.
+            # Positive when the agent closes distance, zero when stationary,
+            # negative when moving away. Telescopes over the episode to
+            # progress_weight * (initial_dist - final_dist) — policy-invariant.
             dist_to_goal = np.linalg.norm(self.get_xy() - self.cur_goal_xy)
-            reward -= self._distance_weight * dist_to_goal
+            if self._prev_dist_to_goal is None:
+                # First step of the episode — no previous distance yet.
+                progress_reward = 0.0
+            else:
+                progress_reward = self._progress_weight * (
+                    self._prev_dist_to_goal - dist_to_goal)
+            self._prev_dist_to_goal = float(dist_to_goal)
+            reward += progress_reward
 
             # Shift for singletask (reward_task_id) environments.
             if self._reward_task_id is not None:

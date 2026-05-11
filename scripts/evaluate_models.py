@@ -34,8 +34,8 @@ from tqdm import tqdm
 _repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, _repo_root)
 import zermelo_env  # noqa — registers gymnasium envs
-from zermelo_env.zermelo_config import load_config, config_to_env_kwargs, get_flow_runtime
-from zermelo_env.zermelo_flow import DynamicNetCDFFlowField, DynamicTGVFlowField, FlowField
+from zermelo_env.zermelo_config import load_config, config_to_env_kwargs, build_hit_flow_cfg
+from zermelo_env.hit_chain import HITChainFlow
 
 # ── Config ───────────────────────────────────────────────────────────────────
 RESULTS_DIR = os.path.join(_repo_root, 'results', 'zermelo_hit_poor_quality_offline_results')
@@ -406,19 +406,10 @@ def stitch_episode_video(episode_frames, output_path):
 def plot_trajectories(all_results):
     """Plot 2D trajectories with flow field background."""
     cfg = load_config(None)
-    dyn_cfg, static_path = get_flow_runtime(cfg)
-    if dyn_cfg.get('enabled', False):
-        mode = dyn_cfg['mode']
-        if mode == 'netcdf':
-            flow = DynamicNetCDFFlowField({**dyn_cfg.get('netcdf', {}),
-                                            'x_range': dyn_cfg['x_range'],
-                                            'y_range': dyn_cfg['y_range']})
-        else:
-            flow = DynamicTGVFlowField(dyn_cfg)
-        flow_t = 0.0
-    else:
-        flow = FlowField(os.path.join(_repo_root, static_path))
-        flow_t = None
+    flow_kwargs = build_hit_flow_cfg(cfg)
+    flow_kwargs.pop('frames_per_step', None)
+    flow = HITChainFlow(**flow_kwargs)
+    flow_frame = 0.0
     maze_unit, offset = 4.0, 4.0
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
@@ -432,13 +423,10 @@ def plot_trajectories(all_results):
                     ax.add_patch(plt.Rectangle((x, y), maze_unit, maze_unit,
                                                facecolor='#cccccc', edgecolor='#999999',
                                                linewidth=0.5))
-        # Flow field (snapshot at t=0 for dynamic flows).
+        # Flow field snapshot at the start of the chain.
         xs = np.linspace(-2, 26, 25)
         ys = np.linspace(-2, 26, 25)
-        if flow_t is None:
-            vx, vy = flow.get_flow_grid(xs, ys)
-        else:
-            vx, vy = flow.get_flow_grid(xs, ys, t=flow_t)
+        vx, vy = flow.get_flow_grid(xs, ys, frame=flow_frame)
         xx, yy = np.meshgrid(xs, ys)
         ax.quiver(xx, yy, vx, vy, alpha=0.12, color='gray', scale=30)
 
@@ -473,21 +461,11 @@ def plot_trajectories(all_results):
 def animate_trajectories(all_results, fps=30, env_dt=0.1):
     """Animate all 3 algorithms drawing trajectories simultaneously over an
     evolving flow field. Output: one MP4 with three side-by-side panels.
-
-    Skipped for netcdf flows: per-frame slice loads make this prohibitively
-    slow at full eval scale.
     """
     cfg = load_config(None)
-    dyn_cfg, static_path = get_flow_runtime(cfg)
-    if dyn_cfg.get('enabled', False) and dyn_cfg.get('mode') == 'netcdf':
-        print('  Skipping animate_trajectories (netcdf flow).')
-        return
-    if dyn_cfg.get('enabled', False):
-        flow = DynamicTGVFlowField(dyn_cfg)
-        flow_is_dynamic = True
-    else:
-        flow = FlowField(os.path.join(_repo_root, static_path))
-        flow_is_dynamic = False
+    flow_kwargs = build_hit_flow_cfg(cfg)
+    fps_per_step = float(flow_kwargs.pop('frames_per_step', 1.0))
+    flow = HITChainFlow(**flow_kwargs)
 
     # Pre-compute trajectories as fixed-length arrays. After an episode ends,
     # its position stays pinned at the final point (so the "pen" stops moving
@@ -530,11 +508,8 @@ def animate_trajectories(all_results, fps=30, env_dt=0.1):
                                                facecolor='#cccccc', edgecolor='#999999',
                                                linewidth=0.5))
 
-        # Initial flow snapshot at t=0 (gets updated each frame).
-        if flow_is_dynamic:
-            vx, vy = flow.get_flow_grid(xs, ys, t=0.0)
-        else:
-            vx, vy = flow.get_flow_grid(xs, ys)
+        # Initial flow snapshot at frame=0 (updated each animation frame).
+        vx, vy = flow.get_flow_grid(xs, ys, frame=0.0)
         q = ax.quiver(xx, yy, vx, vy, alpha=0.18, color='gray', scale=30)
         quivers.append(q)
 
@@ -567,11 +542,10 @@ def animate_trajectories(all_results, fps=30, env_dt=0.1):
     print(f'  Animating {max_len} frames -> {path}')
     with imageio.get_writer(path, fps=fps, macro_block_size=1) as writer:
         for f in tqdm(range(max_len), desc='  frames'):
-            t = f * env_dt
-            if flow_is_dynamic:
-                vx, vy = flow.get_flow_grid(xs, ys, t=t)
-                for q in quivers:
-                    q.set_UVC(vx, vy)
+            flow_frame = f * fps_per_step
+            vx, vy = flow.get_flow_grid(xs, ys, frame=flow_frame)
+            for q in quivers:
+                q.set_UVC(vx, vy)
             for algo_idx, algo in enumerate(ALGO_ORDER):
                 arts = line_artists[algo_idx]
                 for ep, ln, head in zip(padded[algo], arts['lines'], arts['heads']):

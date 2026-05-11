@@ -280,6 +280,13 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         start_frame=start_frame,
     ))
 
+    # Initial distance for the progress-shaping term (Ng et al. 1999): the
+    # per-step reward is k * (prev_dist - curr_dist), which telescopes to
+    # k * (initial_dist - final_dist) over the episode — policy-invariant
+    # in contrast to a raw -k*dist penalty.
+    prev_dist = float(np.linalg.norm(
+        env.unwrapped.get_xy() - np.array(env.unwrapped.cur_goal_xy)))
+
     ep_data = defaultdict(list)
     done = False
     step = 0
@@ -288,7 +295,7 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
     ep_goal_r = 0.0
     ep_energy_r = 0.0
     ep_time_r = 0.0
-    ep_dist_r = 0.0
+    ep_progress_r = 0.0
     wp_tol = route_cfg['waypoint_tolerance']
     # Per-waypoint timeout as a fraction of the episode budget; this auto-
     # scales with max_episode_steps so the route can never silently exceed
@@ -333,11 +340,17 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         step_energy_r = info.get('energy_cost', 0.0)
         step_time_r = -reward_cfg['time_weight']
         step_dist = info.get('dist_to_goal', 0.0)
-        step_dist_r = -reward_cfg['distance_weight'] * step_dist
+        # Progress shaping (potential-based, Ng et al. 1999): positive when
+        # the agent closes distance to goal, negative when it moves away.
+        # Telescopes to (initial_dist - final_dist), so it does not bias the
+        # optimal policy — unlike a raw -k*dist penalty which taxes long
+        # detours through helpful eddies.
+        step_progress_r = reward_cfg['progress_weight'] * (prev_dist - step_dist)
+        prev_dist = step_dist
         ep_goal_r += step_goal_r
         ep_energy_r += step_energy_r
         ep_time_r += step_time_r
-        ep_dist_r += step_dist_r
+        ep_progress_r += step_progress_r
         ep_dists.append(step_dist)
 
         ep_data['observations'].append(ob)
@@ -355,7 +368,7 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         ep_data['goal_reward_components'].append(step_goal_r)
         ep_data['energy_reward_components'].append(step_energy_r)
         ep_data['time_reward_components'].append(step_time_r)
-        ep_data['distance_reward_components'].append(step_dist_r)
+        ep_data['progress_reward_components'].append(step_progress_r)
 
         ob = next_ob
         step += 1
@@ -367,7 +380,7 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache, xy_bounds):
         goal_r=ep_goal_r,
         energy_r=ep_energy_r,
         time_r=ep_time_r,
-        dist_r=ep_dist_r,
+        progress_r=ep_progress_r,
         dist_sum=float(np.sum(ep_dists)),
     )
     return ep_data, stats
@@ -481,10 +494,11 @@ def main(_):
     ep_goal_rewards = np.array([s['goal_r'] for s in stats_list])
     ep_energy_costs = np.array([s['energy_r'] for s in stats_list])
     ep_time_costs = np.array([s['time_r'] for s in stats_list])
-    ep_dist_costs = np.array([s['dist_r'] for s in stats_list])
+    ep_progress_rewards = np.array([s['progress_r'] for s in stats_list])
     ep_dist_sums = np.array([s['dist_sum'] for s in stats_list])
     total_steps = int(ep_lengths.sum())
-    ep_total_rewards = ep_goal_rewards + ep_energy_costs + ep_time_costs + ep_dist_costs
+    ep_total_rewards = (ep_goal_rewards + ep_energy_costs
+                        + ep_time_costs + ep_progress_rewards)
 
     print(f'\n=== Dataset stats (use these to set reward params) ===')
     print(f'Total steps: {total_steps}')
@@ -498,28 +512,31 @@ def main(_):
 
     print(f'\n--- Reward breakdown (current weights: goal={reward_cfg["goal_reward"]}, '
           f'energy={reward_cfg["energy_weight"]}, time={reward_cfg["time_weight"]}, '
-          f'distance={reward_cfg["distance_weight"]}) ---')
+          f'progress={reward_cfg["progress_weight"]}) ---')
     abs_total = abs(ep_total_rewards).mean() + 1e-9
-    print(f'  Total reward  — mean: {ep_total_rewards.mean():.3f}  '
+    print(f'  Total reward    — mean: {ep_total_rewards.mean():.3f}  '
           f'min: {ep_total_rewards.min():.3f}  max: {ep_total_rewards.max():.3f}')
-    print(f'  Goal portion  — mean: {ep_goal_rewards.mean():.3f}  '
+    print(f'  Goal portion    — mean: {ep_goal_rewards.mean():.3f}  '
           f'(% of |total|: {100*abs(ep_goal_rewards.mean()) / abs_total:.0f}%)')
-    print(f'  Energy cost   — mean: {ep_energy_costs.mean():.3f}  '
+    print(f'  Energy cost     — mean: {ep_energy_costs.mean():.3f}  '
           f'(% of |total|: {100*abs(ep_energy_costs.mean()) / abs_total:.0f}%)')
-    print(f'  Time cost     — mean: {ep_time_costs.mean():.3f}  '
+    print(f'  Time cost       — mean: {ep_time_costs.mean():.3f}  '
           f'(% of |total|: {100*abs(ep_time_costs.mean()) / abs_total:.0f}%)')
-    print(f'  Distance cost — mean: {ep_dist_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_dist_costs.mean()) / abs_total:.0f}%)')
+    print(f'  Progress reward — mean: {ep_progress_rewards.mean():.3f}  '
+          f'(% of |total|: {100*abs(ep_progress_rewards.mean()) / abs_total:.0f}%)')
 
     avg_len = ep_lengths.mean()
     avg_anorm = ep_action_norms.mean()
-    avg_dist_sum = ep_dist_sums.mean()
-    print(f'\n--- Suggested reward params (targeting ~50% of goal_reward as total penalty) ---')
+    # For progress, total telescopes to (initial_dist - final_dist). On
+    # successful episodes that's roughly the start-to-goal distance.
+    avg_init_dist = float(np.mean([s['dist_sum'] / max(s['length'], 1)
+                                   for s in stats_list]))  # rough proxy
+    print(f'\n--- Suggested reward params (targeting ~50% of goal_reward per term) ---')
     print(f'  time_weight     ≈ {0.5 / avg_len:.5f}   (so {avg_len:.0f} steps × time_weight ≈ 0.5)')
     print(f'  energy_weight   ≈ {0.5 / (avg_len * avg_anorm):.5f}   '
           f'(so {avg_len:.0f} steps × {avg_anorm:.2f} avg_norm × energy_weight ≈ 0.5)')
-    print(f'  distance_weight ≈ {0.5 / max(avg_dist_sum, 1e-9):.5f}   '
-          f'(so Σdist={avg_dist_sum:.0f} × distance_weight ≈ 0.5)')
+    print(f'  progress_weight ≈ 0.5 / (typical_start_distance ~ 15) ≈ 0.03   '
+          f'(scale-invariant: total = progress_weight × travelled_distance)')
     print(f'  Run: python scripts/analyze_rewards.py  to visualize and sweep weights\n')
 
     save_path = run_cfg['save_path']
