@@ -33,7 +33,7 @@ import numpy as np
 from absl import app, flags
 from tqdm import trange
 
-from utils import dataset_common as dc
+from helpers import dataset_common as dc
 from zermelo_env.zermelo_config import load_config
 
 FLAGS = flags.FLAGS

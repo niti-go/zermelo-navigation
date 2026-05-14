@@ -37,7 +37,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
-from utils import training_common as tc  # noqa: E402
+from helpers import training_common as tc  # noqa: E402
 from zermelo_env.zermelo_config import load_config  # noqa: E402
 
 

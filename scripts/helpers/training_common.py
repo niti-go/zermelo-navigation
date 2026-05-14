@@ -18,7 +18,7 @@ import numpy as np
 import zermelo_env  # noqa — registers gymnasium envs
 from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
 
-# Repo root — this file lives at scripts/utils/, two levels below.
+# Repo root — this file lives at scripts/helpers/, two levels below.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
 

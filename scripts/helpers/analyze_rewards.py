@@ -19,15 +19,15 @@ with `recompute_rewards.py`.
 
 Usage:
     # Analyze with current config weights:
-    PYTHONPATH=. python scripts/utils/analyze_rewards.py
+    PYTHONPATH=. python scripts/helpers/analyze_rewards.py
 
     # Override one or more weights for this run only (config unchanged):
-    PYTHONPATH=. python scripts/utils/analyze_rewards.py \
+    PYTHONPATH=. python scripts/helpers/analyze_rewards.py \
         --action_weight=0.7 --fixed_hover_cost=0.15
 
     # Choose a different "what fraction of goal_reward should each
     # component contribute?" target for the recommendation block:
-    PYTHONPATH=. python scripts/utils/analyze_rewards.py --target_fraction=0.4
+    PYTHONPATH=. python scripts/helpers/analyze_rewards.py --target_fraction=0.4
 """
 import os
 import pathlib
@@ -38,7 +38,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from absl import app, flags
 
-# This file lives at scripts/utils/. Add its own dir for sibling imports
+# This file lives at scripts/helpers/. Add its own dir for sibling imports
 # (training_common is in the same folder) and the repo root for zermelo_env.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)

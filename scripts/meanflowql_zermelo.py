@@ -45,7 +45,7 @@ sys.path.insert(0, _SCRIPT_DIR)
 sys.path.insert(0, _REPO_ROOT)
 sys.path.insert(0, _MEANFLOWQL_ROOT)
 
-from utils import training_common as tc  # noqa: E402
+from helpers import training_common as tc  # noqa: E402
 from zermelo_env.zermelo_config import load_config  # noqa: E402
 
 # MeanFlowQL imports.

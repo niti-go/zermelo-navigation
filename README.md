@@ -41,7 +41,7 @@ scripts/
   meanflowql_zermelo.py     # MeanFlowQL training.
   visualize.py / test_env.py / evaluate_models.py
   launch_trainings.sh       # Spawn BC + DT + MFQL in parallel tmux sessions.
-  utils/                    # Shared helpers + secondary tools.
+  helpers/                  # Shared helpers + secondary tools.
     dataset_common.py         # Helpers for both dataset generators.
     training_common.py        # Dataset loader + eval env for the trainers.
     recompute_rewards.py      # Re-score an existing dataset with new weights.
@@ -65,11 +65,11 @@ PYTHONPATH=. python scripts/generate_dataset.py --num_workers=16
 PYTHONPATH=. python scripts/generate_straight_dataset.py --num_workers=16
 
 # 3. (Optional) Inspect the reward distribution and get weight suggestions.
-PYTHONPATH=. python scripts/utils/analyze_rewards.py
+PYTHONPATH=. python scripts/helpers/analyze_rewards.py
 
 # 4. (Optional) Re-score an existing dataset with new reward weights —
 #    no need to regenerate.
-PYTHONPATH=. python scripts/utils/recompute_rewards.py --from_config
+PYTHONPATH=. python scripts/helpers/recompute_rewards.py --from_config
 
 # 5. (Optional) Visualize a handful of trajectories from the most recent
 #    .npz to datasets/video.mp4.
@@ -79,7 +79,7 @@ PYTHONPATH=. python scripts/visualize.py
 #
 #  (a) All three algorithms in parallel, auto-picking GPUs and detaching
 #      into tmux sessions (recommended on multi-GPU boxes):
-bash scripts/launch_trainings.sh
+PROJ_WANDB=straight_general_v1 bash scripts/launch_trainings.sh
 #      PROJ_WANDB=straight20k_v1 SEED=42 bash scripts/launch_trainings.sh
 #      tmux attach -t bc_zermelo    # then Ctrl-b d to detach again
 #
