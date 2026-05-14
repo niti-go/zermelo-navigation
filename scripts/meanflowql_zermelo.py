@@ -235,7 +235,7 @@ def main(_):
     # Load the zermelo YAML config up front so we can log it alongside flags.
     zermelo_cfg = load_config(FLAGS.zermelo_config)
     zermelo_cfg_src = FLAGS.zermelo_config or os.path.join(
-        _repo_root, 'configs', 'zermelo_config.yaml')
+        _repo_root, 'zermelo_config.yaml')
 
     # Initialize experiment logging
     exp_name = get_exp_name(FLAGS.seed)

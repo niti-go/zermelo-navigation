@@ -212,7 +212,7 @@ def main():
     # Load the zermelo YAML config up front so we can log it alongside argparse flags.
     zermelo_cfg = load_config(args.zermelo_config)
     zermelo_cfg_src = args.zermelo_config or os.path.join(
-        _repo_root, 'configs', 'zermelo_config.yaml')
+        _repo_root, 'zermelo_config.yaml')
 
     # Wandb.
     exp_name = f'bc_sd{args.seed:03d}_{time.strftime("%Y%m%d_%H%M%S")}'

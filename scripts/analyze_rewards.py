@@ -100,7 +100,7 @@ Usage:
     python scripts/analyze_rewards.py --dataset datasets/my_dataset.npz
 
     # Use a specific config (for reward weight context):
-    python scripts/analyze_rewards.py --config configs/zermelo_config.yaml
+    python scripts/analyze_rewards.py --config zermelo_config.yaml
 """
 import pathlib
 
