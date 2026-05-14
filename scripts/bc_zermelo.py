@@ -12,7 +12,7 @@ cd ~/zermelo-navigation
 PYTHONPATH=. python scripts/generate_dataset.py
 
 # 3. (Optional) Recompute rewards with new weights — no regeneration needed
-PYTHONPATH=. python scripts/recompute_rewards.py \
+PYTHONPATH=. python scripts/utils/recompute_rewards.py \
     --action_weight=<aw> \
     --fixed_hover_cost=<hc> \
     --progress_weight=<pw>
@@ -66,7 +66,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
 sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
-import _training_common as tc  # noqa: E402
+from utils import training_common as tc  # noqa: E402
 from zermelo_env.zermelo_config import load_config  # noqa: E402
 
 

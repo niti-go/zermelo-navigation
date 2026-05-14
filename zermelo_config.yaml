@@ -55,17 +55,17 @@ task:
 reward:
   goal_reward: 100.0
   energy:
-    action_weight: 0.3
-    fixed_hover_cost: 0.0
-  progress_weight: 0.5            # potential-based shaping (Ng et al. 1999)
+    action_weight: 0.7
+    fixed_hover_cost: 0.05
+  progress_weight: 1.5            # potential-based shaping (Ng et al. 1999)
   drift_threshold: 0.0            # logging-only
 
 # --- Dataset generation ---------------------------------------------------
 run:
   seed: 0
-  num_episodes: 10
+  num_episodes: 20000
   max_episode_steps: 1000
-  save_path: datasets/small_generalized_flow_dataset.npz
+  save_path: datasets/straight_oracle_20k.npz
 
 # Diversity controls — only used by generate_dataset.py (the diverse
 # generator). The straight-line oracle ignores this block entirely.

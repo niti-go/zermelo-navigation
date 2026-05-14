@@ -12,13 +12,13 @@ step, including the goal step.
 
 Usage:
     cd ~/zermelo-navigation
-    PYTHONPATH=. python scripts/recompute_rewards.py \
+    PYTHONPATH=. python scripts/utils/recompute_rewards.py \
         --action_weight=0.015 \
         --fixed_hover_cost=0.088 \
         --progress_weight=0.5
 
     # Or read all weights from the config file:
-    PYTHONPATH=. python scripts/recompute_rewards.py --from_config
+    PYTHONPATH=. python scripts/utils/recompute_rewards.py --from_config
 """
 import os
 import sys
@@ -26,12 +26,13 @@ import sys
 import numpy as np
 from absl import app, flags
 
-# Make scripts/ importable for the shared helpers, repo root for `import zermelo_env`.
+# This file lives at scripts/utils/. Add its own dir for sibling imports
+# (training_common is here too), plus the repo root for `import zermelo_env`.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _SCRIPT_DIR)
-sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
+sys.path.insert(0, os.path.dirname(os.path.dirname(_SCRIPT_DIR)))
 
-import _training_common as tc  # noqa: E402
+import training_common as tc  # noqa: E402
 from zermelo_env.zermelo_config import load_config  # noqa: E402
 
 FLAGS = flags.FLAGS

@@ -2,6 +2,7 @@
 results/
 *.npz
 wandb/
+logs/
 
 # Build artifacts
 *.egg-info/
