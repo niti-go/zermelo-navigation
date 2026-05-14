@@ -30,8 +30,10 @@ def main():
     parser.add_argument('--live', action='store_true', help='Show live rendering in a matplotlib window')
     # Reward shaping parameters.
     parser.add_argument('--goal_reward', type=float, default=1.0, help='Reward for reaching goal')
-    parser.add_argument('--energy_weight', type=float, default=0.0, help='Penalty weight for action magnitude')
-    parser.add_argument('--time_weight', type=float, default=0.0, help='Per-step penalty when moving (not drifting)')
+    parser.add_argument('--action_weight', type=float, default=0.0,
+                        help='Energy cost per unit ||action|| (dynamic component)')
+    parser.add_argument('--fixed_hover_cost', type=float, default=0.0,
+                        help='Per-step baseline energy to stay airborne in still air')
     parser.add_argument('--progress_weight', type=float, default=0.0, help='Reward weight for distance reduction')
     parser.add_argument('--timeout_penalty', type=float, default=0.0, help='Penalty when episode times out')
     args = parser.parse_args()
@@ -42,8 +44,8 @@ def main():
         terminate_at_goal=False,
         max_episode_steps=args.num_steps + 10,
         goal_reward=args.goal_reward,
-        energy_weight=args.energy_weight,
-        time_weight=args.time_weight,
+        action_weight=args.action_weight,
+        fixed_hover_cost=args.fixed_hover_cost,
         progress_weight=args.progress_weight,
         timeout_penalty=args.timeout_penalty,
     )
@@ -137,7 +139,7 @@ def main():
         print('Tip: pass --policy zero to see pure flow drift (no agent action).')
         print('Tip: pass --policy oracle to see BFS-guided navigation through flow.')
         print('Tip: pass --live to watch the episode in real time.')
-        print('Tip: use --energy_weight, --time_weight, --progress_weight for reward shaping.')
+        print('Tip: use --action_weight, --fixed_hover_cost, --progress_weight for reward shaping.')
 
     if args.live:
         import matplotlib.pyplot as plt

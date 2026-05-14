@@ -21,9 +21,9 @@ PYTHONPATH=. python scripts/analyze_rewards.py
 
 # 4. Recompute rewards in the existing dataset (no regeneration needed)
 PYTHONPATH=. python scripts/recompute_rewards.py \
-    --energy_weight=<recommended ew> \
-    --time_weight=<recommended tw> \
-    --distance_weight=<recommended dw>
+    --action_weight=<recommended aw> \
+    --fixed_hover_cost=<recommended hc> \
+    --progress_weight=<recommended pw>
 
 # 5. Visualize trajectories from the dataset (optional)
 PYTHONPATH=. python scripts/visualize.py

@@ -2,18 +2,22 @@
 
 BACKGROUND
 ----------
-The Zermelo environment rewards each trajectory with four components:
+The Zermelo environment rewards each trajectory with these components:
 
     reward_per_step = goal_reward * (reached goal this step)
-                    - energy_weight * ||action||
-                    - time_weight * 1
-                    - distance_weight * dist_to_goal
+                    - action_weight * ||action||
+                    - fixed_hover_cost
+                    - distance_weight * dist_to_goal     (analysis-only term)
 
-The goal_reward is a large sparse bonus on the step the agent reaches the
-goal. The three penalty weights control how harshly the reward function
-penalizes energy use, elapsed time, and distance from the goal at every step.
+`action_weight * ||action|| + fixed_hover_cost` is the *energy cost* — the
+dynamic component charged for moving plus the baseline power to stay
+airborne in still air (paid every step, including the goal step).
 
-We need to choose the three penalty weights so that:
+NOTE: `distance_weight` is an analysis-only term used by this script's
+sweep; the env's actual reward uses progress_weight instead (see
+zermelo_config.yaml). This script does not touch the env's progress term.
+
+We need to choose the penalty weights so that:
   (a) Goal-reaching dominates: successful episodes have positive total reward.
   (b) Penalties meaningfully differentiate efficient vs. inefficient paths.
   (c) The per-step reward provides a useful dense learning signal for the
@@ -28,52 +32,54 @@ distances — no need to re-run the environment.
 
 WHY TWO STAGES
 --------------
-Energy, time, and distance penalties are highly correlated: longer episodes
-accumulate more energy, more steps, and more cumulative distance. Jointly
-sweeping all three on a grid doesn't work well because:
+Action cost, hover cost, and distance penalties are highly correlated: longer
+episodes accumulate more action effort, more hover steps, and more cumulative
+distance. Jointly sweeping all three on a grid doesn't work well because:
 
   1. The penalties move together, so a "balance" constraint (each component
      contributing a meaningful fraction) is hard to satisfy with 3 correlated
      axes — one always dominates.
-  2. The distance penalty serves a fundamentally different purpose than
-     energy/time. Energy and time differentiate *trajectory quality* at the
-     episode level (was this path efficient?). Distance provides a *dense
-     per-step learning signal* (am I getting closer to the goal right now?).
+  2. The distance penalty serves a fundamentally different purpose than the
+     two energy components. Action+hover differentiate *trajectory quality*
+     at the episode level (was this path efficient?). Distance provides a
+     *dense per-step learning signal* (am I getting closer right now?).
      An objective that maximizes episode-level reward spread doesn't capture
      the value of per-step signal quality.
-  3. Distance sums can be orders of magnitude larger than energy sums or step
-     counts, so interesting distance_weight values fall between grid points.
+  3. Distance sums can be orders of magnitude larger than action norms or
+     step counts, so interesting distance_weight values fall between grid
+     points.
 
-Because of this, energy/time and distance are tuned separately.
+Because of this, the two energy components and distance are tuned separately.
 
-STAGE 1 — energy_weight and time_weight
-----------------------------------------
+STAGE 1 — action_weight and fixed_hover_cost
+--------------------------------------------
 These two weights control trajectory quality differentiation. We sweep a 2D
-grid of (energy_weight, time_weight) combinations and pick the one that
+grid of (action_weight, fixed_hover_cost) combinations and pick the one that
 maximizes reward variance among successful episodes, subject to:
 
-  - All successful episodes keep reward above goal_reward/3 after subtracting energy+time
-    penalties. That leftover third is reserved for the distance penalty added
-    in Stage 2 (so the total can stay positive once all three penalties apply).
-  - The median energy+time penalty fraction falls in a moderate band (the code
-    tries 10%-30% first, relaxing to wider bands if no combo qualifies).
+  - All successful episodes keep reward above goal_reward/3 after subtracting
+    action+hover penalties. That leftover third is reserved for the distance
+    penalty added in Stage 2 (so the total can stay positive once all three
+    penalties apply).
+  - The median action+hover penalty fraction falls in a moderate band (the
+    code tries 10%-30% first, relaxing to wider bands if no combo qualifies).
 
-To make the grid meaningful, raw signals (raw total action norms (energy)
-and raw step counts (time)) are normalized to unit variance
-before sweeping. This ensures the grid covers comparable effect ranges for
-both axes regardless of their raw magnitude differences. The grid is
-log-spaced for better coverage across dynamic ranges, and a refinement pass
-runs a fine grid around the best coarse result.
+To make the grid meaningful, raw signals (total action norms and raw step
+counts) are normalized to unit variance before sweeping. This ensures the
+grid covers comparable effect ranges for both axes regardless of their raw
+magnitude differences. The grid is log-spaced for better coverage across
+dynamic ranges, and a refinement pass runs a fine grid around the best
+coarse result.
 
 STAGE 2 — distance_weight
 --------------------------
 Rather than optimizing distance_weight for episode-level spread (where it
-adds little beyond energy/time), we set it to produce a useful per-step
+adds little beyond action+hover), we set it to produce a useful per-step
 signal for the RL algorithm. Specifically:
 
   distance_weight is scaled so that the median per-step distance penalty is
-  comparable in magnitude (1:1 ratio) to the median per-step energy + time
-  penalty.
+  comparable in magnitude (1:1 ratio) to the median per-step
+  action + hover penalty.
 
 This means at every step, the agent "feels" the distance gradient at roughly
 the same scale as the action cost — enough to provide learning signal without
@@ -85,8 +91,8 @@ should learn to avoid.
 
 OUTPUTS
 -------
-  - Recommended energy_weight, time_weight, distance_weight values.
-  - Per-episode stacked bar chart: goal vs. energy vs. time vs. distance.
+  - Recommended action_weight, fixed_hover_cost, distance_weight values.
+  - Per-episode stacked bar chart: goal vs. action vs. hover vs. distance.
   - Distribution plots: total reward, episode length, component breakdowns.
   - Penalty scatter plots: correlations between penalty components.
 
@@ -163,7 +169,7 @@ def _get_dist_to_goal(data):
 
 
 def _compute_episode_stats(data: dict, episodes: list, goal_reward: float,
-                            energy_weight: float, time_weight: float,
+                            action_weight: float, fixed_hover_cost: float,
                             distance_weight: float):
     """Compute per-episode reward breakdown using given weights.
 
@@ -176,7 +182,7 @@ def _compute_episode_stats(data: dict, episodes: list, goal_reward: float,
     # Use stored goal_reward_components if available (nonzero on the success step).
     goal_components = data.get('goal_reward_components', None)
 
-    ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total = [], [], [], [], [], []
+    ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total = [], [], [], [], [], []
     for start, end in episodes:
         length = end - start
         action_norms = np.linalg.norm(actions[start:end], axis=1)
@@ -191,19 +197,19 @@ def _compute_episode_stats(data: dict, episodes: list, goal_reward: float,
             reached_goal = ep_rewards.max() >= goal_reward - 1e-6
 
         g = goal_reward if reached_goal else 0.0
-        e = -energy_weight * action_norms.sum()
-        t = -time_weight * length
+        e = -action_weight * action_norms.sum()
+        t = -fixed_hover_cost * length
         d = -distance_weight * dist_to_goal[start:end].sum()
 
         ep_lengths.append(length)
         ep_goal.append(g)
-        ep_energy.append(e)
-        ep_time.append(t)
+        ep_action_cost.append(e)
+        ep_hover_cost.append(t)
         ep_dist.append(d)
         ep_total.append(g + e + t + d)
 
     return (np.array(ep_lengths), np.array(ep_goal),
-            np.array(ep_energy), np.array(ep_time),
+            np.array(ep_action_cost), np.array(ep_hover_cost),
             np.array(ep_dist), np.array(ep_total))
 
 
@@ -218,13 +224,13 @@ def _save_fig(fig, name: str):
 # Plot 1: Per-episode stacked bar chart
 # ---------------------------------------------------------------------------
 
-def plot_episode_breakdown(ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                           goal_reward, energy_weight, time_weight, distance_weight):
+def plot_episode_breakdown(ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                           goal_reward, action_weight, fixed_hover_cost, distance_weight):
     n = len(ep_goal)
     order = np.argsort(ep_total)  # sort by total reward ascending
     ep_goal = ep_goal[order]
-    ep_energy = ep_energy[order]
-    ep_time = ep_time[order]
+    ep_action_cost = ep_action_cost[order]
+    ep_hover_cost = ep_hover_cost[order]
     ep_dist = ep_dist[order]
     ep_total = ep_total[order]
 
@@ -233,8 +239,8 @@ def plot_episode_breakdown(ep_goal, ep_energy, ep_time, ep_dist, ep_total,
     w = 0.2
 
     ax.bar(x - 1.5 * w, ep_goal, width=w, label='Goal reward', color='#4CAF50')
-    ax.bar(x - 0.5 * w, ep_energy, width=w, label='Energy cost', color='#F44336')
-    ax.bar(x + 0.5 * w, ep_time, width=w, label='Time cost', color='#FF9800')
+    ax.bar(x - 0.5 * w, ep_action_cost, width=w, label='Action cost', color='#F44336')
+    ax.bar(x + 0.5 * w, ep_hover_cost, width=w, label='Hover cost', color='#FF9800')
     ax.bar(x + 1.5 * w, ep_dist, width=w, label='Distance cost', color='#9C27B0')
     ax.plot(x, ep_total, 'k.--', markersize=6, linewidth=1.2, label='Total')
 
@@ -243,8 +249,8 @@ def plot_episode_breakdown(ep_goal, ep_energy, ep_time, ep_dist, ep_total,
     ax.set_ylabel('Reward')
     ax.set_title(
         f'Per-episode reward breakdown\n'
-        f'goal={goal_reward}, ew={energy_weight:.5f}, '
-        f'tw={time_weight:.5f}, dw={distance_weight:.5f}')
+        f'goal={goal_reward}, aw={action_weight:.5f}, '
+        f'hc={fixed_hover_cost:.5f}, dw={distance_weight:.5f}')
     ax.legend(loc='upper left')
     fig.tight_layout()
     _save_fig(fig, 'episode_breakdown')
@@ -254,12 +260,12 @@ def plot_episode_breakdown(ep_goal, ep_energy, ep_time, ep_dist, ep_total,
 # Plot 2: Distributions
 # ---------------------------------------------------------------------------
 
-def plot_distributions(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                       goal_reward, energy_weight, time_weight, distance_weight):
+def plot_distributions(ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                       goal_reward, action_weight, fixed_hover_cost, distance_weight):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     fig.suptitle(
         f'Reward distributions  (goal={goal_reward}, '
-        f'ew={energy_weight}, tw={time_weight}, dw={distance_weight})',
+        f'aw={action_weight}, hc={fixed_hover_cost}, dw={distance_weight})',
         fontsize=12)
 
     def _hist(ax, data, title, color, xlabel):
@@ -274,8 +280,8 @@ def plot_distributions(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_tota
     _hist(axes[0, 0], ep_total, 'Total reward per episode', '#2196F3', 'total reward')
     _hist(axes[0, 1], ep_lengths, 'Episode length', '#9C27B0', 'steps')
     _hist(axes[0, 2], ep_goal, 'Goal reward per episode', '#4CAF50', 'goal reward')
-    _hist(axes[1, 0], ep_energy, 'Energy cost per episode', '#F44336', 'energy cost (negative)')
-    _hist(axes[1, 1], ep_time, 'Time cost per episode', '#FF9800', 'time cost (negative)')
+    _hist(axes[1, 0], ep_action_cost, 'Action cost per episode', '#F44336', 'action cost (negative)')
+    _hist(axes[1, 1], ep_hover_cost, 'Hover cost per episode', '#FF9800', 'hover cost (negative)')
     _hist(axes[1, 2], ep_dist, 'Distance cost per episode', '#9C27B0', 'distance cost (negative)')
 
     fig.tight_layout()
@@ -287,9 +293,9 @@ def plot_distributions(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_tota
 # ---------------------------------------------------------------------------
 
 def _compute_distance_weight(data, episodes, succ_mask, action_norms_per_ep,
-                              lengths, energy_weight, time_weight,
+                              lengths, action_weight, fixed_hover_cost,
                               target_ratio=1.0):
-    """Set distance_weight so per-step distance penalty ≈ target_ratio × per-step energy+time penalty.
+    """Set distance_weight so per-step distance penalty ≈ target_ratio × per-step action+hover penalty.
 
     This gives the RL agent a dense gradient signal at every step that is
     comparable in magnitude to the other per-step penalties, without needing
@@ -297,7 +303,7 @@ def _compute_distance_weight(data, episodes, succ_mask, action_norms_per_ep,
 
     Args:
         target_ratio: desired ratio of median per-step distance penalty to
-            median per-step (energy + time) penalty. 1.0 means equal magnitude.
+            median per-step (action + hover) penalty. 1.0 means equal magnitude.
 
     Returns:
         distance_weight (float)
@@ -305,8 +311,8 @@ def _compute_distance_weight(data, episodes, succ_mask, action_norms_per_ep,
     dist_to_goal = _get_dist_to_goal(data)
     actions = data['actions']
 
-    per_step_energy = []  # per-step energy penalty magnitude
-    per_step_time = []    # per-step time penalty (just the weight)
+    per_step_action_cost = []  # per-step action penalty magnitude
+    per_step_hover_cost = []    # per-step hover penalty (just the weight)
     per_step_dist = []    # per-step raw distance (before weighting)
 
     for i, (start, end) in enumerate(episodes):
@@ -314,14 +320,14 @@ def _compute_distance_weight(data, episodes, succ_mask, action_norms_per_ep,
             continue
         length = end - start
         norms = np.linalg.norm(actions[start:end], axis=1)
-        per_step_energy.append(energy_weight * norms.mean())
-        per_step_time.append(time_weight)
+        per_step_action_cost.append(action_weight * norms.mean())
+        per_step_hover_cost.append(fixed_hover_cost)
         per_step_dist.append(dist_to_goal[start:end].mean())
 
     if not per_step_dist:
         return 0.0
 
-    median_other = np.median(per_step_energy) + np.median(per_step_time)
+    median_other = np.median(per_step_action_cost) + np.median(per_step_hover_cost)
     median_raw_dist = np.median(per_step_dist)
 
     if median_raw_dist < 1e-12:
@@ -335,7 +341,7 @@ def sweep_weights(data, episodes, goal_reward):
     """Two-stage weight selection: sweep ew×tw on a log-spaced 2D grid, then
     set distance_weight independently based on per-step signal magnitude.
 
-    Stage 1 — energy_weight × time_weight sweep:
+    Stage 1 — action_weight × fixed_hover_cost sweep:
       Normalizes raw signals to unit variance so the grid covers comparable
       effect ranges. Uses a log-spaced grid for better dynamic range coverage.
       Constraints:
@@ -345,9 +351,9 @@ def sweep_weights(data, episodes, goal_reward):
 
     Stage 2 — distance_weight (set independently):
       Scales dw so the median per-step distance penalty is comparable to the
-      median per-step energy+time penalty. This ensures dense learning signal
+      median per-step action+hover penalty. This ensures dense learning signal
       without needing to jointly optimize — distance serves a fundamentally
-      different purpose (per-step gradient) than energy/time (trajectory quality).
+      different purpose (per-step gradient) than action+hover (trajectory quality).
     """
     action_norms_per_ep = []
     dist_sums_per_ep = []
@@ -382,61 +388,61 @@ def sweep_weights(data, episodes, goal_reward):
     print(f'  Successful episodes: {succ_mask.sum()} / {len(succ_mask)}')
 
     # --- Normalize raw signals to unit variance ---
-    # This makes the grid uniform in "effect space" so energy and time
+    # This makes the grid uniform in "effect space" so action and hover
     # axes have comparable scales regardless of raw magnitude differences.
     norm_std = np.std(action_norms_per_ep[succ_mask]) if succ_mask.sum() > 1 else np.std(action_norms_per_ep)
     len_std = np.std(lengths[succ_mask]) if succ_mask.sum() > 1 else np.std(lengths)
     norm_std = max(norm_std, 1e-9)
     len_std = max(len_std, 1e-9)
 
-    normed_energy = action_norms_per_ep / norm_std  # unit-variance
-    normed_time = lengths / len_std
+    normed_action = action_norms_per_ep / norm_std  # unit-variance
+    normed_hover = lengths / len_std
 
-    print(f'  Normalization — energy_std: {norm_std:.2f}, length_std: {len_std:.2f}')
+    print(f'  Normalization — action_std: {norm_std:.2f}, length_std: {len_std:.2f}')
 
     # --- Estimate distance budget ---
     # We'll reserve headroom for distance in Stage 1. Estimate the ratio of
-    # median per-step distance to median per-step (energy+time) so we know
+    # median per-step distance to median per-step (action+hover) so we know
     # roughly how much penalty budget distance will need at target_ratio=1.0.
-    # With target_ratio=1.0, distance penalty ≈ energy+time penalty in total,
+    # With target_ratio=1.0, distance penalty ≈ action+hover penalty in total,
     # so we need to reserve ~50% of the total penalty budget for distance.
-    # Use a conservative 1/3 reservation (distance gets 1/3, energy+time get 2/3).
+    # Use a conservative 1/3 reservation (distance gets 1/3, action+hover get 2/3).
     dist_budget_fraction = 1.0 / 3.0
 
-    # --- Stage 1: Log-spaced 2D sweep over ew_norm × tw_norm ---
+    # --- Stage 1: Log-spaced 2D sweep over aw_norm × hc_norm ---
     # Weights are in normalized space; real weights = w_norm / std.
     # At max normalized weight, median penalty ≈ goal_reward.
-    succ_normed_energy = normed_energy[succ_mask] if succ_mask.any() else normed_energy
-    succ_normed_time = normed_time[succ_mask] if succ_mask.any() else normed_time
+    succ_normed_action = normed_action[succ_mask] if succ_mask.any() else normed_action
+    succ_normed_hover = normed_hover[succ_mask] if succ_mask.any() else normed_hover
 
     n_grid = 40  # 40×40 = 1600 combos (fast, much finer than old 20×20 slice)
-    ew_norm_max = goal_reward / (np.median(succ_normed_energy) + 1e-9)
-    tw_norm_max = goal_reward / (np.median(succ_normed_time) + 1e-9)
+    aw_norm_max = goal_reward / (np.median(succ_normed_action) + 1e-9)
+    hc_norm_max = goal_reward / (np.median(succ_normed_hover) + 1e-9)
 
     # Log-spaced from a small fraction to max, plus zero.
-    ew_norm_min = ew_norm_max * 1e-3
-    tw_norm_min = tw_norm_max * 1e-3
-    ew_norm_vals = np.concatenate([[0.0], np.geomspace(ew_norm_min, ew_norm_max, n_grid - 1)])
-    tw_norm_vals = np.concatenate([[0.0], np.geomspace(tw_norm_min, tw_norm_max, n_grid - 1)])
+    aw_norm_min = aw_norm_max * 1e-3
+    hc_norm_min = hc_norm_max * 1e-3
+    aw_norm_vals = np.concatenate([[0.0], np.geomspace(aw_norm_min, aw_norm_max, n_grid - 1)])
+    hc_norm_vals = np.concatenate([[0.0], np.geomspace(hc_norm_min, hc_norm_max, n_grid - 1)])
 
     best_combo = None
     best_spread = -1.0
 
     g = successes.astype(float) * goal_reward  # precompute goal vector
 
-    # Penalty fraction targets for energy+time only (leaving room for distance).
+    # Penalty fraction targets for action+hover only (leaving room for distance).
     et_frac_bands = [
         (0.10 * (1 - dist_budget_fraction), 0.30 * (1 - dist_budget_fraction)),
         (0.05 * (1 - dist_budget_fraction), 0.50 * (1 - dist_budget_fraction)),
         (0.0, 1.0),
     ]
     for lo, hi in et_frac_bands:
-        for ew_n in ew_norm_vals:
-            for tw_n in tw_norm_vals:
-                if ew_n == 0 and tw_n == 0:
+        for aw_n in aw_norm_vals:
+            for hc_n in hc_norm_vals:
+                if aw_n == 0 and hc_n == 0:
                     continue
 
-                total = g - ew_n * normed_energy - tw_n * normed_time
+                total = g - aw_n * normed_action - hc_n * normed_hover
 
                 if not succ_mask.any():
                     continue
@@ -450,7 +456,7 @@ def sweep_weights(data, episodes, goal_reward):
                 if np.any(succ_total <= min_headroom):
                     continue
 
-                # Constraint 2: median ew+tw penalty fraction in [lo, hi].
+                # Constraint 2: median aw+hc penalty fraction in [lo, hi].
                 succ_penalties = goal_reward - succ_total
                 med_frac = float(np.median(succ_penalties)) / goal_reward
                 if not (lo <= med_frac <= hi):
@@ -459,10 +465,10 @@ def sweep_weights(data, episodes, goal_reward):
                 spread = float(np.std(succ_total))
                 if spread > best_spread:
                     best_spread = spread
-                    best_combo = (ew_n, tw_n, med_frac, spread)
+                    best_combo = (aw_n, hc_n, med_frac, spread)
 
         if best_combo is not None:
-            print(f'  Stage 1 selection: ew+tw penalty frac [{lo:.0%}, {hi:.0%}] '
+            print(f'  Stage 1 selection: aw+hc penalty frac [{lo:.0%}, {hi:.0%}] '
                   f'(reserving {dist_budget_fraction:.0%} for distance), '
                   f'best success_std={best_spread:.4f}')
             break
@@ -470,30 +476,30 @@ def sweep_weights(data, episodes, goal_reward):
     if best_combo is None:
         # Unconstrained fallback: maximize spread.
         print('  Stage 1: unconstrained fallback (no combo met criteria)')
-        for ew_n in ew_norm_vals:
-            for tw_n in tw_norm_vals:
-                if ew_n == 0 and tw_n == 0:
+        for aw_n in aw_norm_vals:
+            for hc_n in hc_norm_vals:
+                if aw_n == 0 and hc_n == 0:
                     continue
-                total = g - ew_n * normed_energy - tw_n * normed_time
+                total = g - aw_n * normed_action - hc_n * normed_hover
                 if succ_mask.any():
                     spread = float(np.std(total[succ_mask]))
                     if spread > best_spread:
                         best_spread = spread
                         succ_total = total[succ_mask]
                         med_frac = float(np.median(goal_reward - succ_total)) / goal_reward
-                        best_combo = (ew_n, tw_n, med_frac, spread)
+                        best_combo = (aw_n, hc_n, med_frac, spread)
 
     # --- Refine: fine grid around best combo ---
-    coarse_ew_n, coarse_tw_n = best_combo[0], best_combo[1]
+    coarse_aw_n, coarse_hc_n = best_combo[0], best_combo[1]
     refine_n = 20
-    refine_ew = np.linspace(max(coarse_ew_n * 0.5, 0), coarse_ew_n * 1.5, refine_n)
-    refine_tw = np.linspace(max(coarse_tw_n * 0.5, 0), coarse_tw_n * 1.5, refine_n)
+    refine_aw = np.linspace(max(coarse_aw_n * 0.5, 0), coarse_aw_n * 1.5, refine_n)
+    refine_hc = np.linspace(max(coarse_hc_n * 0.5, 0), coarse_hc_n * 1.5, refine_n)
 
-    for ew_n in refine_ew:
-        for tw_n in refine_tw:
-            if ew_n == 0 and tw_n == 0:
+    for aw_n in refine_aw:
+        for hc_n in refine_hc:
+            if aw_n == 0 and hc_n == 0:
                 continue
-            total = g - ew_n * normed_energy - tw_n * normed_time
+            total = g - aw_n * normed_action - hc_n * normed_hover
             if not succ_mask.any():
                 continue
             succ_total = total[succ_mask]
@@ -504,21 +510,21 @@ def sweep_weights(data, episodes, goal_reward):
             spread = float(np.std(succ_total))
             if spread > best_spread:
                 best_spread = spread
-                best_combo = (ew_n, tw_n, med_frac, spread)
+                best_combo = (aw_n, hc_n, med_frac, spread)
 
-    best_ew_n, best_tw_n = best_combo[0], best_combo[1]
+    best_aw_n, best_hc_n = best_combo[0], best_combo[1]
 
     # Convert normalized weights back to real weights.
-    best_ew = best_ew_n / norm_std
-    best_tw = best_tw_n / len_std
+    best_aw = best_aw_n / norm_std
+    best_hc = best_hc_n / len_std
 
-    print(f'  Stage 1 result: ew={best_ew:.6f}, tw={best_tw:.6f} '
-          f'(normed: ew_n={best_ew_n:.4f}, tw_n={best_tw_n:.4f})')
+    print(f'  Stage 1 result: aw={best_aw:.6f}, hc={best_hc:.6f} '
+          f'(normed: aw_n={best_aw_n:.4f}, hc_n={best_hc_n:.4f})')
 
     # --- Stage 2: Set distance_weight from per-step signal ratio ---
     best_dw = _compute_distance_weight(
         data, episodes, succ_mask, action_norms_per_ep, lengths,
-        energy_weight=best_ew, time_weight=best_tw, target_ratio=1.0)
+        action_weight=best_aw, fixed_hover_cost=best_hc, target_ratio=1.0)
 
     # Verify adding distance doesn't break the positivity constraint.
     # Use the reserved budget: distance penalty should use at most
@@ -536,15 +542,15 @@ def sweep_weights(data, episodes, goal_reward):
             best_dw = max_dw_from_budget
 
         # Hard check: at least 90% of successful eps must stay positive.
-        total_with_dist = (g - best_ew * action_norms_per_ep
-                           - best_tw * lengths
+        total_with_dist = (g - best_aw * action_norms_per_ep
+                           - best_hc * lengths
                            - best_dw * dist_sums_per_ep)
         succ_positive_frac = np.mean(total_with_dist[succ_mask] > 0)
         if succ_positive_frac < 0.90:
             # Scale down to hit 90% threshold using the 90th percentile dist sum.
             p90_dist = np.percentile(dist_sums_per_ep[succ_mask], 90)
-            headroom = (goal_reward - best_ew * action_norms_per_ep[succ_mask]
-                        - best_tw * lengths[succ_mask])
+            headroom = (goal_reward - best_aw * action_norms_per_ep[succ_mask]
+                        - best_hc * lengths[succ_mask])
             p90_headroom = np.percentile(headroom, 10)  # 10th percentile = tightest
             safe_dw = max(p90_headroom / (p90_dist + 1e-12) * 0.95, 0.0)
             print(f'  Stage 2: further scaled dw to {safe_dw:.6f} '
@@ -552,12 +558,12 @@ def sweep_weights(data, episodes, goal_reward):
             best_dw = safe_dw
 
     print(f'  Stage 2 result: dw={best_dw:.6f} (per-step signal targeting '
-          f'1.0x energy+time magnitude)')
+          f'1.0x action+hover magnitude)')
 
     return dict(
-        ew_vals=ew_norm_vals / norm_std, tw_vals=tw_norm_vals / len_std,
+        aw_vals=aw_norm_vals / norm_std, hc_vals=hc_norm_vals / len_std,
         dw_vals=np.array([best_dw]),
-        best_ew=best_ew, best_tw=best_tw, best_dw=best_dw,
+        best_aw=best_aw, best_hc=best_hc, best_dw=best_dw,
         best_spread=best_spread,
         # Pass per-episode data for plots.
         action_norms_per_ep=action_norms_per_ep,
@@ -568,26 +574,26 @@ def sweep_weights(data, episodes, goal_reward):
 
 def plot_penalty_scatter(sweep, goal_reward):
     """Scatter plots of penalty components against each other."""
-    best_ew, best_tw, best_dw = sweep['best_ew'], sweep['best_tw'], sweep['best_dw']
+    best_aw, best_hc, best_dw = sweep['best_aw'], sweep['best_hc'], sweep['best_dw']
     norms = sweep['action_norms_per_ep']
     lens = sweep['lengths']
     dists = sweep['dist_sums_per_ep']
     succs = sweep['successes'].astype(bool)
 
-    energy_costs = best_ew * norms
-    time_costs = best_tw * lens
+    action_costs = best_aw * norms
+    hover_costs = best_hc * lens
     dist_costs = best_dw * dists
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(
         f'Penalty scatter at recommended weights\n'
-        f'ew={best_ew:.5f}, tw={best_tw:.5f}, dw={best_dw:.5f}',
+        f'aw={best_aw:.5f}, hc={best_hc:.5f}, dw={best_dw:.5f}',
         fontsize=11)
 
     for ax, (x_data, y_data, xlabel, ylabel) in zip(axes, [
-        (energy_costs, time_costs, 'Energy cost', 'Time cost'),
-        (energy_costs, dist_costs, 'Energy cost', 'Distance cost'),
-        (time_costs, dist_costs, 'Time cost', 'Distance cost'),
+        (action_costs, hover_costs, 'Action cost', 'Hover cost'),
+        (action_costs, dist_costs, 'Action cost', 'Distance cost'),
+        (hover_costs, dist_costs, 'Hover cost', 'Distance cost'),
     ]):
         ax.scatter(x_data[succs], y_data[succs],
                    c='#4CAF50', label='Reached goal', alpha=0.7, edgecolors='white', s=50)
@@ -605,8 +611,8 @@ def plot_penalty_scatter(sweep, goal_reward):
 # Console summary
 # ---------------------------------------------------------------------------
 
-def print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                  goal_reward, energy_weight, time_weight, distance_weight):
+def print_summary(ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                  goal_reward, action_weight, fixed_hover_cost, distance_weight):
     n = len(ep_lengths)
     successes = (ep_goal > 0).sum()
     abs_total = np.abs(ep_total).mean() + 1e-9
@@ -616,13 +622,13 @@ def print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
     print(f'{"="*65}')
     print(f'Episodes: {n}  |  Successful: {successes} ({100*successes/n:.0f}%)')
     print(f'Current weights: goal_reward={goal_reward}, '
-          f'energy_weight={energy_weight}, time_weight={time_weight}, '
+          f'action_weight={action_weight}, fixed_hover_cost={fixed_hover_cost}, '
           f'distance_weight={distance_weight}')
     print()
     print(f'{"Component":<18} {"Mean":>8} {"Std":>8} {"Min":>8} {"Max":>8} {"% of |total|":>13}')
     print('-' * 65)
     for name, arr in [('Total reward', ep_total), ('Goal reward', ep_goal),
-                      ('Energy cost', ep_energy), ('Time cost', ep_time),
+                      ('Action cost', ep_action_cost), ('Hover cost', ep_hover_cost),
                       ('Distance cost', ep_dist)]:
         pct = 100 * abs(arr.mean()) / abs_total
         print(f'{name:<18} {arr.mean():>8.3f} {arr.std():>8.3f} '
@@ -635,8 +641,8 @@ def print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
     print()
 
     goal_frac = abs(ep_goal.mean()) / abs_total
-    energy_frac = abs(ep_energy.mean()) / abs_total
-    time_frac = abs(ep_time.mean()) / abs_total
+    action_frac = abs(ep_action_cost.mean()) / abs_total
+    hover_frac = abs(ep_hover_cost.mean()) / abs_total
     dist_frac = abs(ep_dist.mean()) / abs_total
 
     print('TUNING GUIDANCE:')
@@ -644,10 +650,10 @@ def print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
         print('  [!] Goal reward is <50% of total — penalties may dominate, consider reducing weights.')
     if goal_frac > 0.95:
         print('  [!] Goal reward is >95% of total — penalties are negligible, consider increasing weights.')
-    if energy_frac < 0.05 and energy_weight > 0:
-        print('  [!] Energy cost is very small — try doubling energy_weight.')
-    if time_frac < 0.05 and time_weight > 0:
-        print('  [!] Time cost is very small — try doubling time_weight.')
+    if action_frac < 0.05 and action_weight > 0:
+        print('  [!] Action cost is very small — try doubling action_weight.')
+    if hover_frac < 0.05 and fixed_hover_cost > 0:
+        print('  [!] Hover cost is very small — try doubling fixed_hover_cost.')
     if dist_frac < 0.05 and distance_weight > 0:
         print('  [!] Distance cost is very small — try doubling distance_weight.')
     if ep_total.std() < 0.05:
@@ -690,27 +696,27 @@ def main(_):
     # --- Step 1: Sweep weight grid to find best combo ---
     print('Sweeping weight combinations...')
     sweep = sweep_weights(data, episodes, goal_reward)
-    best_ew, best_tw, best_dw = sweep['best_ew'], sweep['best_tw'], sweep['best_dw']
-    print(f'Best weights found: energy_weight={best_ew:.5f}, '
-          f'time_weight={best_tw:.5f}, distance_weight={best_dw:.5f}')
+    best_aw, best_hc, best_dw = sweep['best_aw'], sweep['best_hc'], sweep['best_dw']
+    print(f'Best weights found: action_weight={best_aw:.5f}, '
+          f'fixed_hover_cost={best_hc:.5f}, distance_weight={best_dw:.5f}')
 
     # --- Step 2: Compute episode stats at the best weights ---
-    (ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total) = _compute_episode_stats(
-        data, episodes, goal_reward, best_ew, best_tw, best_dw)
+    (ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total) = _compute_episode_stats(
+        data, episodes, goal_reward, best_aw, best_hc, best_dw)
 
-    print_summary(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                  goal_reward, best_ew, best_tw, best_dw)
+    print_summary(ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                  goal_reward, best_aw, best_hc, best_dw)
 
     # --- Step 3: Generate all plots at the best weights ---
     print(f'Generating plots to {SAVE_DIR}/ ...')
     plot_penalty_scatter(sweep, goal_reward)
-    plot_episode_breakdown(ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                           goal_reward, best_ew, best_tw, best_dw)
-    plot_distributions(ep_lengths, ep_goal, ep_energy, ep_time, ep_dist, ep_total,
-                       goal_reward, best_ew, best_tw, best_dw)
+    plot_episode_breakdown(ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                           goal_reward, best_aw, best_hc, best_dw)
+    plot_distributions(ep_lengths, ep_goal, ep_action_cost, ep_hover_cost, ep_dist, ep_total,
+                       goal_reward, best_aw, best_hc, best_dw)
     print(f'\nRecommended config values:')
-    print(f'  energy_weight:   {best_ew:.5f}')
-    print(f'  time_weight:     {best_tw:.5f}')
+    print(f'  action_weight:   {best_aw:.5f}')
+    print(f'  fixed_hover_cost:     {best_hc:.5f}')
     print(f'  distance_weight: {best_dw:.5f}')
     print('Done.')
 

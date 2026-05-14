@@ -86,6 +86,8 @@ def config_to_env_kwargs(cfg, max_file=None):
     task_cfg = cfg['task']
     reward_cfg = cfg['reward']
 
+    energy_cfg = reward_cfg['energy']
+
     return dict(
         maze_unit=cfg['maze']['unit'],
         maze_height=cfg['maze']['height'],
@@ -95,11 +97,9 @@ def config_to_env_kwargs(cfg, max_file=None):
         fixed_start_goal=(task_cfg['start_goal_mode'] == 'fixed'),
         fixed_init_ij=tuple(task_cfg['fixed_start_ij']),
         fixed_goal_ij=tuple(task_cfg['fixed_goal_ij']),
-        # logging.goal_reward is the only weight the env actually uses at
-        # eval time; the rest are recomputed downstream from raw components.
         goal_reward=reward_cfg['goal_reward'],
-        energy_weight=reward_cfg['energy_weight'],
-        time_weight=reward_cfg['time_weight'],
+        action_weight=energy_cfg['action_weight'],
+        fixed_hover_cost=energy_cfg['fixed_hover_cost'],
         progress_weight=reward_cfg['progress_weight'],
         drift_threshold=reward_cfg['drift_threshold'],
         ob_type=cfg['observation']['type'],

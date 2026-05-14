@@ -186,7 +186,6 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
     ep_dists = []
     ep_goal_r = 0.0
     ep_energy_r = 0.0
-    ep_time_r = 0.0
     ep_progress_r = 0.0
 
     info = {}
@@ -222,8 +221,9 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
         ep_anorms.append(np.linalg.norm(action))
 
         step_goal_r = info.get('success', 0.0) * reward_cfg['goal_reward']
+        # `energy_cost` from env already bundles action_weight * ||a|| AND
+        # fixed_hover_cost (both paid every step, including the goal step).
         step_energy_r = info.get('energy_cost', 0.0)
-        step_time_r = -reward_cfg['time_weight']
         step_dist = info.get('dist_to_goal', 0.0)
         # Progress shaping (potential-based, Ng et al. 1999): positive when
         # the agent closes distance to goal, negative when it moves away.
@@ -232,7 +232,6 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
         prev_dist = step_dist
         ep_goal_r += step_goal_r
         ep_energy_r += step_energy_r
-        ep_time_r += step_time_r
         ep_progress_r += step_progress_r
         ep_dists.append(step_dist)
 
@@ -249,7 +248,6 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
         ep_data['dist_to_goal'].append(step_dist)
         ep_data['goal_reward_components'].append(step_goal_r)
         ep_data['energy_reward_components'].append(step_energy_r)
-        ep_data['time_reward_components'].append(step_time_r)
         ep_data['progress_reward_components'].append(step_progress_r)
 
         ob = next_ob
@@ -261,7 +259,6 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
         success=info.get('success', 0.0),
         goal_r=ep_goal_r,
         energy_r=ep_energy_r,
-        time_r=ep_time_r,
         progress_r=ep_progress_r,
         dist_sum=float(np.sum(ep_dists)),
     )
@@ -434,13 +431,12 @@ def main(_):
     ep_successes = np.array([s['success'] for s in stats_list])
     ep_goal_rewards = np.array([s['goal_r'] for s in stats_list])
     ep_energy_costs = np.array([s['energy_r'] for s in stats_list])
-    ep_time_costs = np.array([s['time_r'] for s in stats_list])
     ep_progress_rewards = np.array([s['progress_r'] for s in stats_list])
     ep_dist_sums = np.array([s['dist_sum'] for s in stats_list])
     total_steps = int(ep_lengths.sum())
-    ep_total_rewards = (ep_goal_rewards + ep_energy_costs
-                        + ep_time_costs + ep_progress_rewards)
+    ep_total_rewards = (ep_goal_rewards + ep_energy_costs + ep_progress_rewards)
 
+    energy_cfg = reward_cfg['energy']
     print(f'\n=== Dataset stats (straight-line oracle) ===')
     print(f'Total steps: {total_steps}')
     print(f'Episodes: {len(ep_lengths)}  |  Success rate: {ep_successes.mean():.1%}')
@@ -452,7 +448,8 @@ def main(_):
           f'min: {ep_dist_sums.min():.1f}  max: {ep_dist_sums.max():.1f}')
 
     print(f'\n--- Reward breakdown (current weights: goal={reward_cfg["goal_reward"]}, '
-          f'energy={reward_cfg["energy_weight"]}, time={reward_cfg["time_weight"]}, '
+          f'action_weight={energy_cfg["action_weight"]}, '
+          f'fixed_hover_cost={energy_cfg["fixed_hover_cost"]}, '
           f'progress={reward_cfg["progress_weight"]}) ---')
     abs_total = abs(ep_total_rewards).mean() + 1e-9
     print(f'  Total reward    — mean: {ep_total_rewards.mean():.3f}  '
@@ -460,9 +457,7 @@ def main(_):
     print(f'  Goal portion    — mean: {ep_goal_rewards.mean():.3f}  '
           f'(% of |total|: {100*abs(ep_goal_rewards.mean()) / abs_total:.0f}%)')
     print(f'  Energy cost     — mean: {ep_energy_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_energy_costs.mean()) / abs_total:.0f}%)')
-    print(f'  Time cost       — mean: {ep_time_costs.mean():.3f}  '
-          f'(% of |total|: {100*abs(ep_time_costs.mean()) / abs_total:.0f}%)')
+          f'(action + hover; % of |total|: {100*abs(ep_energy_costs.mean()) / abs_total:.0f}%)')
     print(f'  Progress reward — mean: {ep_progress_rewards.mean():.3f}  '
           f'(% of |total|: {100*abs(ep_progress_rewards.mean()) / abs_total:.0f}%)')
 

@@ -120,10 +120,21 @@ run:
 # training/eval time. Training scripts (bc, dt, meanflowql) train directly
 # on `data['rewards']`
 #
+# Energy model (real-world drone analogy)
+# ----------------------------------------
+# Every step the agent pays an energy cost:
+#     energy_cost = action_weight * ||action|| + fixed_hover_cost
+# - `action_weight`     : marginal power draw per unit of commanded action.
+# - `fixed_hover_cost`  : baseline power just to stay airborne in still air.
+#                         Hovering is NOT free — even at action = 0 the drone
+#                         burns this much per step.
+# Both are charged every step, including the goal step (you still have to
+# hover the instant you arrive).
+#
 # To change weights AFTER a dataset has been generated without regenerating,
 # run:
 #   python scripts/recompute_rewards.py \
-#       --energy_weight=... --time_weight=... --distance_weight=...
+#       --action_weight=... --fixed_hover_cost=...
 # That script overwrites `data['rewards']` in place using the per-step
 # reward components stored alongside it.
 #
@@ -131,8 +142,9 @@ run:
 # "drifting" in the printed summary; it does not affect the reward).
 reward:
   goal_reward: 100.0
-  energy_weight: 0.3
-  time_weight: 0
+  energy:
+    action_weight: 0.3            # marginal cost per unit of ||action||
+    fixed_hover_cost: 0.0         # baseline power to hover (per step)
   progress_weight: 0.5            # potential-based shaping coefficient (Ng et
                                   # al. 1999). Per-step reward = progress_weight
                                   # * (prev_dist - curr_dist). Telescopes to

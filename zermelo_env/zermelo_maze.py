@@ -54,8 +54,8 @@ def make_zermelo_maze_env(*args, **kwargs):
             maze_map_override=None,
             # Reward parameters.
             goal_reward=1.0,
-            energy_weight=0.0,
-            time_weight=0.0,
+            action_weight=0.0,
+            fixed_hover_cost=0.0,
             progress_weight=0.0,
             drift_threshold=0.01,
             goal_tolerance=1.0,
@@ -80,8 +80,13 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             # Reward parameters.
             self._goal_reward = goal_reward
-            self._energy_weight = energy_weight
-            self._time_weight = time_weight
+            # Energy model: per step the agent pays
+            #     action_weight * ||action||  +  fixed_hover_cost
+            # The hover term is the baseline power to stay airborne in still
+            # air — charged every step (including the goal step), since the
+            # drone has to hover the instant it arrives.
+            self._action_weight = action_weight
+            self._fixed_hover_cost = fixed_hover_cost
             # Potential-based shaping coefficient (Ng et al. 1999): the
             # per-step reward is progress_weight * (prev_dist - curr_dist),
             # which telescopes to progress_weight * (initial_dist - final_dist)
@@ -498,12 +503,12 @@ def make_zermelo_maze_env(*args, **kwargs):
                 info['success'] = 0.0
                 reward = 0.0
 
-            # Energy cost: penalize action magnitude (powered movement).
-            energy_cost = -self._energy_weight * action_magnitude
+            # Energy cost: action_weight * ||action|| (dynamic) +
+            # fixed_hover_cost (baseline power to stay airborne in still air).
+            # Both are paid every step, goal step included.
+            energy_cost = -(self._action_weight * action_magnitude
+                            + self._fixed_hover_cost)
             reward += energy_cost
-
-            # Time cost: constant per-step penalty (every step costs time).
-            reward -= self._time_weight
 
             # Progress reward: potential-based shaping with Phi = -dist_to_goal.
             # Positive when the agent closes distance, zero when stationary,
