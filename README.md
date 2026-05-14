@@ -5,23 +5,7 @@ maze) with a time-varying background fluid flow. The goal is to learn
 policies that **exploit** flow currents — like a boat using a river — by
 stitching together the useful parts of many suboptimal demonstrations.
 
-## Conda envs
-
-Two envs, one for each phase of the pipeline:
-
-```bash
-# Generate datasets, run the env, build the flow cache.
-conda env create -f environment-zermelo.yaml
-conda activate zermelo
-pip install -e .
-
-# Train BC / DT / MeanFlowQL.
-conda env create -f environment-flowrl.yaml
-conda activate flowrl
 ```
-
-The split exists because the training stack (jax + torch + wandb) doesn't
-need to coexist with the data-gen stack (mujoco + xarray + netCDF).
 
 ## Layout
 
@@ -48,6 +32,32 @@ scripts/
     analyze_rewards.py        # Inspect reward distribution; recommend weights.
 ext/MeanFlowQL/           # MeanFlowQL algo (git submodule).
 datasets/                 # HIT*.nc inputs + generated .npz outputs.
+
+## Conda envs
+
+Two envs for different phases of the pipeline:
+
+```bash
+# Generate datasets, run the env, build the flow cache.
+conda env create -f environment-zermelo.yaml
+conda activate zermelo
+pip install -e .
+
+# Train BC / DT / MeanFlowQL.
+conda env create -f environment-flowrl.yaml
+conda activate flowrl
+
+```
+
+## Flow data
+
+Create a `datasets/` folder in the root, and create symlinks to the HIT1.nc - HIT49.nc flow files:
+
+```bash
+mkdir -p datasets
+cd datasets
+ln -s /path/to/your/HIT/dir/HIT*.nc .
+ls HIT*.nc | wc -l   # should print 49
 ```
 
 ## Running an experiment
@@ -114,23 +124,9 @@ Browse all projects: <https://wandb.ai/RL_Control_JX/projects>
 
 Once training is done (or you have at least one saved checkpoint per algo),
 `scripts/evaluate_models.py` runs BC, DT, and MeanFlowQL on the same set of
-(start, goal) pairs and produces a directory of plots + metrics. Eval
-defaults to the **held-out** flow segment (HIT46..HIT49, frames the policies
-never saw at dataset-gen time), plus a sanity-check pass on the training
-segment so you can see the generalization gap.
+(start, goal) pairs and produces a directory of plots + metrics. 
 
-All knobs are constants at the top of the file (no CLI flags). The main ones:
 
-```python
-EXP_PROJECT        = 'straight_general_v1'  # which exp/<project>/ to evaluate
-RUN_TAG            = None                    # None = latest run dir per algo
-NUM_EVAL_EPISODES  = 200
-NUM_VIDEO_EPISODES = 3
-EVAL_FLOW_SEGMENTS = ('heldout', 'train')   # drop 'train' to skip sanity pass
-CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval'}
-```
-
-Then:
 
 ```bash
 conda activate flowrl
@@ -138,40 +134,6 @@ python scripts/evaluate_models.py
 # (auto-picks the least-loaded GPU; pin one with `CUDA_VISIBLE_DEVICES=N` or
 # by setting the constant of the same name at the top of evaluate_models.py)
 ```
-
-For each segment, the same 200 (start, goal) pairs are run through all
-three policies (`SEED` seeds the sampler), so per-episode comparisons are
-apples-to-apples. The `start_frame` of each episode is spread across the
-target flow segment via `deterministic_spread` (mirrors dataset gen).
-
-Output lands in `results/<EXP_PROJECT>/<timestamp>/`:
-
-```
-manifest.json              # config, resolved checkpoint paths + steps,
-                           # DT target_return, flow-segment metadata
-zermelo_config.json        # snapshot of the config the policies trained on
-metrics.csv / metrics.json # one row per (segment, algo) with bootstrap CIs
-raw_episodes.json          # per-episode results (no frames)
-plots/
-  trajectories_<seg>.png       # 3 panels, one per algo, with flow quiver
-  comparison_<seg>.png         # success / return / length / action bars
-  return_histogram_<seg>.png   # return distributions vs offline dataset
-  success_vs_init_dist_<seg>.png  # does perf degrade on harder tasks?
-  energy_vs_return_<seg>.png   # effort vs return scatter per algo
-  train_vs_heldout.png         # paired bars: the generalization gap
-videos/
-  <seg>_ep01.mp4 ...           # 3-algo stitched videos for the first N eps
-```
-
-The console prints a per-segment results table (success rate, mean return
-with bootstrap CI, mean length, time/episode), and a final "winner" line
-for the primary (held-out) segment.
-
-Held-out caveat: with `flow.train_max_file=45` and `frames_per_step=5`, the
-held-out segment is `4 * 1000 = 4000` frames, so an episode longer than
-~800 steps will wrap modulo `n_frames` back into the training segment.
-`manifest.json` records whether this can happen; most episodes (under ~600
-steps) finish before wrap.
 
 ## Reward
 
@@ -183,14 +145,11 @@ reward = goal_reward · (reached this step)
        + progress_weight · (prev_dist − curr_dist)
 ```
 
-Weights live under `reward:` in `zermelo_config.yaml`. The energy term
-bundles a dynamic action cost with a fixed hover cost (baseline power to
-stay airborne in still air) — both are charged every step.
 
 ## Flow split
 
-`flow.train_max_file: 45` means dataset generators only see `HIT1..HIT45`.
-`HIT46..HIT49` are reserved for held-out evaluation.
+`flow.train_max_file: 45` means the generated offline dataset will only see `HIT1..HIT45`.
+`HIT46..HIT49` will be reserved for held-out evaluation.
 
 ## Registered envs
 
