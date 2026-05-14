@@ -55,25 +55,25 @@ datasets/                 # HIT*.nc inputs + generated .npz outputs.
 ```bash
 # (Once) Build the local-SSD flow cache from HIT*.nc.
 conda activate zermelo
-PYTHONPATH=. python scripts/build_hit_cache.py
+python scripts/build_hit_cache.py
 
 # 1. Edit zermelo_config.yaml — set num_episodes, reward weights, etc.
 
 # 2. Generate the dataset (uses `zermelo` env).
-PYTHONPATH=. python scripts/generate_dataset.py --num_workers=16
+python scripts/generate_dataset.py --num_workers=16
 # or, for a clean straight-line baseline:
-PYTHONPATH=. python scripts/generate_straight_dataset.py --num_workers=16
+python scripts/generate_straight_dataset.py --num_workers=16
 
 # 3. (Optional) Inspect the reward distribution and get weight suggestions.
-PYTHONPATH=. python scripts/helpers/analyze_rewards.py
+python scripts/helpers/analyze_rewards.py
 
 # 4. (Optional) Re-score an existing dataset with new reward weights —
 #    no need to regenerate.
-PYTHONPATH=. python scripts/helpers/recompute_rewards.py --from_config
+python scripts/helpers/recompute_rewards.py --from_config
 
 # 5. (Optional) Visualize a handful of trajectories from the most recent
 #    .npz to datasets/video.mp4.
-PYTHONPATH=. python scripts/visualize.py
+python scripts/visualize.py
 
 # 6. Train. Two options:
 #
@@ -88,6 +88,9 @@ conda activate flowrl
 CUDA_VISIBLE_DEVICES=0 python scripts/bc_zermelo.py        --seed=0 --train_steps=500000
 CUDA_VISIBLE_DEVICES=1 python scripts/dt_zermelo.py        --seed=0 --train_steps=500000
 CUDA_VISIBLE_DEVICES=2 python scripts/meanflowql_zermelo.py --seed=0 --offline_steps=1000000
+
+# 7. Evaluate trained policies on held-out HIT flow (see "Evaluation" below).
+python scripts/evaluate_models.py
 ```
 
 All training scripts default to the dataset path in `zermelo_config.yaml`
@@ -106,6 +109,69 @@ unique timestamps and the run groups `bc` / `dt` / `meanflowql`, so
 re-running the script never overwrites prior runs.
 
 Browse all projects: <https://wandb.ai/RL_Control_JX/projects>
+
+## Evaluation
+
+Once training is done (or you have at least one saved checkpoint per algo),
+`scripts/evaluate_models.py` runs BC, DT, and MeanFlowQL on the same set of
+(start, goal) pairs and produces a directory of plots + metrics. Eval
+defaults to the **held-out** flow segment (HIT46..HIT49, frames the policies
+never saw at dataset-gen time), plus a sanity-check pass on the training
+segment so you can see the generalization gap.
+
+All knobs are constants at the top of the file (no CLI flags). The main ones:
+
+```python
+EXP_PROJECT        = 'straight_general_v1'  # which exp/<project>/ to evaluate
+RUN_TAG            = None                    # None = latest run dir per algo
+NUM_EVAL_EPISODES  = 200
+NUM_VIDEO_EPISODES = 3
+EVAL_FLOW_SEGMENTS = ('heldout', 'train')   # drop 'train' to skip sanity pass
+CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval'}
+```
+
+Then:
+
+```bash
+conda activate flowrl
+python scripts/evaluate_models.py
+# (auto-picks the least-loaded GPU; pin one with `CUDA_VISIBLE_DEVICES=N` or
+# by setting the constant of the same name at the top of evaluate_models.py)
+```
+
+For each segment, the same 200 (start, goal) pairs are run through all
+three policies (`SEED` seeds the sampler), so per-episode comparisons are
+apples-to-apples. The `start_frame` of each episode is spread across the
+target flow segment via `deterministic_spread` (mirrors dataset gen).
+
+Output lands in `results/<EXP_PROJECT>/<timestamp>/`:
+
+```
+manifest.json              # config, resolved checkpoint paths + steps,
+                           # DT target_return, flow-segment metadata
+zermelo_config.json        # snapshot of the config the policies trained on
+metrics.csv / metrics.json # one row per (segment, algo) with bootstrap CIs
+raw_episodes.json          # per-episode results (no frames)
+plots/
+  trajectories_<seg>.png       # 3 panels, one per algo, with flow quiver
+  comparison_<seg>.png         # success / return / length / action bars
+  return_histogram_<seg>.png   # return distributions vs offline dataset
+  success_vs_init_dist_<seg>.png  # does perf degrade on harder tasks?
+  energy_vs_return_<seg>.png   # effort vs return scatter per algo
+  train_vs_heldout.png         # paired bars: the generalization gap
+videos/
+  <seg>_ep01.mp4 ...           # 3-algo stitched videos for the first N eps
+```
+
+The console prints a per-segment results table (success rate, mean return
+with bootstrap CI, mean length, time/episode), and a final "winner" line
+for the primary (held-out) segment.
+
+Held-out caveat: with `flow.train_max_file=45` and `frames_per_step=5`, the
+held-out segment is `4 * 1000 = 4000` frames, so an episode longer than
+~800 steps will wrap modulo `n_frames` back into the training segment.
+`manifest.json` records whether this can happen; most episodes (under ~600
+steps) finish before wrap.
 
 ## Reward
 
