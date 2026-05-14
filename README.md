@@ -1,57 +1,105 @@
 # Zermelo Navigation
 
-Offline reinforcement learning for a Zermelo navigation problem — a point agent navigating a maze with a background fluid flow field.
+Offline RL for Zermelo navigation: a point agent navigates an arena (or
+maze) with a time-varying background fluid flow. The goal is to learn
+policies that **exploit** flow currents — like a boat using a river — by
+stitching together the useful parts of many suboptimal demonstrations.
 
-**The core question:** can an offline RL agent learn to *exploit* fluid currents (like a boat using river currents) by stitching together the best parts of many suboptimal demonstration trajectories?
+## Conda envs
 
-## Structure
-
-```
-configs/                  # Environment and dataset generation config
-scripts/                  # Dataset generation, visualization, evaluation
-zermelo_env/              # Custom Gymnasium environment (self-contained)
-ext/                      # External dependencies (git submodules)
-  ogbench/                # Fork of seohongpark/ogbench (training infrastructure)
-  MeanFlowQL/             # Fork of HiccupRL/MeanFlowQL (offline RL algorithm)
-experiments/              # Training scripts and results for all experiments
-results/                  # Runtime outputs: datasets, checkpoints (gitignored)
-```
-
-## Setup
+Two envs, one for each phase of the pipeline:
 
 ```bash
-# Clone with submodules
-git clone --recurse-submodules <repo-url>
-
-# Install the Zermelo environment
+# Generate datasets, run the env, build the flow cache.
+conda env create -f environment-zermelo.yaml
 conda activate zermelo
 pip install -e .
 
-# (Optional) Install ogbench for training infrastructure
-pip install -e ext/ogbench
+# Train BC / DT / MeanFlowQL.
+conda env create -f environment-flowrl.yaml
+conda activate flowrl
 ```
 
-## Workflow
+The split exists because the training stack (jax + torch + wandb) doesn't
+need to coexist with the data-gen stack (mujoco + xarray + netCDF).
+
+## Layout
+
+```
+zermelo_config.yaml       # Single source of truth for env + dataset + reward.
+zermelo_env/              # Custom Gymnasium env.
+  zermelo_point.py          # Point-mass dynamics with HIT flow.
+  zermelo_maze.py           # + maze walls, reward shaping, rendering.
+  hit_chain.py / hit_cache.py   # Read flow snapshots via local-SSD cache.
+  zermelo_config.py         # YAML loader → env kwargs.
+scripts/
+  build_hit_cache.py        # Transcode HIT*.nc → fast .bin (run once).
+  generate_dataset.py       # Diverse offline dataset (waypoints + personality).
+  generate_straight_dataset.py  # Straight-line oracle dataset.
+  recompute_rewards.py      # Re-score an existing dataset with new weights.
+  bc_zermelo.py             # Behavior Cloning training.
+  dt_zermelo.py             # Decision Transformer training.
+  meanflowql_zermelo.py     # MeanFlowQL training.
+  visualize.py / test_env.py / evaluate_models.py / analyze_rewards.py
+  _dataset_common.py        # Shared helpers for the two generators.
+  _training_common.py       # Shared dataset loader + eval env for the trainers.
+ext/MeanFlowQL/           # MeanFlowQL algo (git submodule).
+datasets/                 # HIT*.nc inputs + generated .npz outputs.
+```
+
+## Running an experiment
 
 ```bash
-# 1. Edit configs/zermelo_config.yaml to set env params
+# (Once) Build the local-SSD flow cache from HIT*.nc.
+conda activate zermelo
+PYTHONPATH=. python scripts/build_hit_cache.py
 
-# 2. Generate dataset
-python scripts/generate_dataset.py
+# 1. Edit zermelo_config.yaml — set num_episodes, reward weights, etc.
 
-# 3. Train (e.g. with MeanFlowQL)
-cd ext/MeanFlowQL
-python main.py --env_name=zermelo-pointmaze-medium-v0 ...
+# 2. Generate the dataset (uses `zermelo` env).
+PYTHONPATH=. python scripts/generate_dataset.py --num_workers=16
+# or, for a clean straight-line baseline:
+PYTHONPATH=. python scripts/generate_straight_dataset.py --num_workers=16
 
-# 4. Evaluate
-python scripts/test_env.py --policy oracle
+# 3. (Optional) Re-score an existing dataset with new reward weights —
+#    no need to regenerate.
+PYTHONPATH=. python scripts/recompute_rewards.py --from_config
+
+# 4. (Optional) Visualize a handful of trajectories from the most recent
+#    .npz to datasets/video.mp4.
+PYTHONPATH=. python scripts/visualize.py
+
+# 5. Train (uses `flowrl` env).
+conda activate flowrl
+python scripts/bc_zermelo.py        --seed=0 --train_steps=500000
+python scripts/dt_zermelo.py        --seed=0 --train_steps=500000
+python scripts/meanflowql_zermelo.py --seed=0 --offline_steps=1000000
 ```
 
-## Environment
+All training scripts default to the dataset path in `zermelo_config.yaml`
+(`run.save_path`) and log to wandb. Pass `--zermelo_dataset=/path/to/foo.npz`
+to override.
 
-The `zermelo_env` package provides Gymnasium environments:
+## Reward
 
-- `zermelo-pointmaze-medium-v0` — maze with fluid flow
-- `zermelo-pointarena-medium-v0` — open arena (boundary only) with fluid flow
+Per-step reward used both at generation time and inside the env:
 
-All parameters (maze layout, flow field, start/goal, rewards, etc.) are controlled by `configs/zermelo_config.yaml`.
+```
+reward = goal_reward · (reached this step)
+       − (action_weight · ||action|| + fixed_hover_cost)
+       + progress_weight · (prev_dist − curr_dist)
+```
+
+Weights live under `reward:` in `zermelo_config.yaml`. The energy term
+bundles a dynamic action cost with a fixed hover cost (baseline power to
+stay airborne in still air) — both are charged every step.
+
+## Flow split
+
+`flow.train_max_file: 45` means dataset generators only see `HIT1..HIT45`.
+`HIT46..HIT49` are reserved for held-out evaluation.
+
+## Registered envs
+
+- `zermelo-pointmaze-medium-v0` — arena or maze (`maze.enabled` in config).
+- `zermelo-pointmaze-medium-singletask{-task1..5}-v0` — single fixed task.

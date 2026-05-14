@@ -1,4 +1,4 @@
-"""Replay 5 random episodes from the most recent .npz dataset and save to video.mp4.
+"""Replay random episodes from the most recent .npz dataset and save to video.mp4.
 
 Usage:
     cd ~/zermelo-navigation
@@ -10,15 +10,17 @@ import sys
 
 os.environ['MUJOCO_GL'] = 'egl'
 
-import gymnasium
-import imageio
-import mujoco
-import numpy as np
+# Make the repo root importable so `zermelo_env` resolves regardless of CWD.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
-import zermelo_env  # noqa: register envs
-from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
+import gymnasium  # noqa: E402
+import imageio  # noqa: E402
+import mujoco  # noqa: E402
+import numpy as np  # noqa: E402
 
-DEFAULT_REPLAY_FRAME = 0.0
+import zermelo_env  # noqa: E402, F401 — register envs
+from zermelo_env.zermelo_config import load_config, config_to_env_kwargs  # noqa: E402
 
 # --- Settings ---
 NUM_EPISODES = 3
@@ -36,7 +38,8 @@ def find_latest_dataset():
     # Exclude val datasets.
     candidates = [c for c in candidates if '-val.npz' not in c]
     if not candidates:
-        print('No .npz dataset found. Run generate_zermelo.py first.')
+        print('No .npz dataset found. Run scripts/generate_dataset.py '
+              '(or generate_straight_dataset.py) first.')
         sys.exit(1)
     latest = max(candidates, key=os.path.getmtime)
     return latest

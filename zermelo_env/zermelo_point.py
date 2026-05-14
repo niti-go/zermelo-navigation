@@ -1,24 +1,51 @@
+"""Point-mass agent in a chained-HIT background flow field.
+
+`ZermeloPointEnv` is the only point-mass env we use; it bundles the MuJoCo
+PointEnv scaffolding (XML, observation space, qpos accessors) with the
+flow-aware step dynamics. The flow advances in *frame* coordinates: each
+env step advances the internal frame counter by `frames_per_step` (which
+may be fractional). The flow at any continuous frame index is provided by
+`HITChainFlow`.
+
+Episode reset can override the starting frame via
+``reset(options={'start_frame': F})``; otherwise the episode begins at
+frame 0.
+"""
+
+import os
+
+import gymnasium
 import mujoco
 import numpy as np
+from gymnasium import utils
+from gymnasium.envs.mujoco import MujocoEnv
+from gymnasium.spaces import Box
 
-from zermelo_env.point import PointEnv
 from zermelo_env.hit_chain import HITChainFlow
 
 
-class ZermeloPointEnv(PointEnv):
-    """Point mass environment with a chained-HIT background flow field.
+class ZermeloPointEnv(MujocoEnv, utils.EzPickle):
+    """Point mass with a chained-HIT background flow field."""
 
-    The flow advances in *frame* coordinates: each env step advances the
-    internal frame counter by ``frames_per_step`` (which may be fractional).
-    The flow at any continuous frame index is provided by ``HITChainFlow``.
+    xml_file = os.path.join(os.path.dirname(__file__), 'assets', 'point.xml')
+    metadata = {
+        'render_modes': ['human', 'rgb_array', 'depth_array'],
+        'render_fps': 10,
+    }
+    if gymnasium.__version__ >= '1.1.0':
+        metadata['render_modes'] += ['rgbd_tuple']
 
-    Episode reset can override the starting frame via
-    ``reset(options={'start_frame': F})``; otherwise the episode begins at
-    frame 0.
-    """
-
-    def __init__(self, hit_flow_cfg, include_flow_in_obs=True,
-                 action_scale=2.0, **kwargs):
+    def __init__(
+        self,
+        hit_flow_cfg,
+        include_flow_in_obs=True,
+        action_scale=2.0,
+        xml_file=None,
+        render_mode='rgb_array',
+        width=200,
+        height=200,
+        **kwargs,
+    ):
         cfg = dict(hit_flow_cfg)
         self._frames_per_step = float(cfg.pop('frames_per_step', 1.0))
         self._flow_field = HITChainFlow(**cfg)
@@ -33,7 +60,21 @@ class ZermeloPointEnv(PointEnv):
         # Frame index at the start of the current episode.
         self._start_frame = 0.0
 
-        super().__init__(**kwargs)
+        if xml_file is None:
+            xml_file = self.xml_file
+        utils.EzPickle.__init__(self, xml_file, **kwargs)
+
+        observation_space = Box(low=-np.inf, high=np.inf, shape=(6,), dtype=np.float64)
+        MujocoEnv.__init__(
+            self,
+            xml_file,
+            frame_skip=5,
+            observation_space=observation_space,
+            render_mode=render_mode,
+            width=width,
+            height=height,
+            **kwargs,
+        )
 
     @property
     def frame(self):
@@ -63,7 +104,6 @@ class ZermeloPointEnv(PointEnv):
 
         self.data.qpos[0] += dt * (agent_vx + flow_vx)
         self.data.qpos[1] += dt * (agent_vy + flow_vy)
-
         self.data.qvel[:] = np.array([0.0, 0.0])
 
         mujoco.mj_step(self.model, self.data, nstep=self.frame_skip)
@@ -73,7 +113,6 @@ class ZermeloPointEnv(PointEnv):
 
         qpos = self.data.qpos.flat.copy()
         qvel = self.data.qvel.flat.copy()
-
         observation = self.get_ob()
 
         if self.render_mode == 'human':
@@ -96,7 +135,10 @@ class ZermeloPointEnv(PointEnv):
 
     def reset_model(self):
         self._frame = float(self._start_frame)
-        return super().reset_model()
+        qpos = self.init_qpos + self.np_random.uniform(size=self.model.nq, low=-0.1, high=0.1)
+        qvel = self.init_qvel + self.np_random.standard_normal(self.model.nv) * 0.1
+        self.set_state(qpos, qvel)
+        return self.get_ob()
 
     def set_start_frame(self, start_frame):
         """Pin the next reset to begin at this flow-clock frame."""
@@ -113,3 +155,12 @@ class ZermeloPointEnv(PointEnv):
             flow_vx, flow_vy = self._flow_field.get_flow(x, y, self._frame)
             return np.concatenate([base_ob, [flow_vx, flow_vy]])
         return base_ob
+
+    def get_xy(self):
+        return self.data.qpos.copy()
+
+    def set_xy(self, xy):
+        qpos = self.data.qpos.copy()
+        qvel = self.data.qvel.copy()
+        qpos[:] = xy
+        self.set_state(qpos, qvel)

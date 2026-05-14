@@ -11,32 +11,28 @@ conda activate zermelo
 cd ~/zermelo-navigation
 PYTHONPATH=. python scripts/generate_dataset.py
 
-# 3. Find good reward weights using the analysis script
-PYTHONPATH=. python scripts/analyze_rewards.py
-#    Check the recommended weights in the output and plots in datasets/hyperparameter_tuning/.
-
-# 4. Recompute rewards in the existing dataset (no regeneration needed)
+# 3. (Optional) Recompute rewards with new weights — no regeneration needed
 PYTHONPATH=. python scripts/recompute_rewards.py \
-    --action_weight=<recommended aw> \
-    --fixed_hover_cost=<recommended hc> \
-    --progress_weight=<recommended pw>
+    --action_weight=<aw> \
+    --fixed_hover_cost=<hc> \
+    --progress_weight=<pw>
 
-# 5. Visualize trajectories from the dataset (optional)
+# 4. (Optional) Visualize trajectories from the dataset
 PYTHONPATH=. python scripts/visualize.py
-#    This saves a video of 5 random trajectories to datasets/video.mp4
+#    This saves a video of N random trajectories to datasets/video.mp4
 
-# 6. Train BC (uses flowrl conda env, can run from any directory)
+# 5. Train BC (uses flowrl conda env, can run from any directory)
 conda activate flowrl
 wandb login
-CUDA_VISIBLE_DEVICES=6 python ~/zermelo-navigation/experiments/zermelo/bc_zermelo.py \
+CUDA_VISIBLE_DEVICES=6 python ~/zermelo-navigation/scripts/bc_zermelo.py \
     --train_steps=500000 \
     --seed=0 \
     --proj_wandb=zermelo_hit_dynamic_poordataset \
     --run_group=bc \
     --wandb_online=True
 
-# 7. Detach tmux: Ctrl+b, then d
-# 8. Reattach later: tmux attach -t bc_zermelo
+# 6. Detach tmux: Ctrl+b, then d
+# 7. Reattach later: tmux attach -t bc_zermelo
 
 === WANDB LOGGING ===
   Entity:  --wandb_entity (default: RL_Control_JX)
@@ -58,18 +54,20 @@ import time
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 os.environ['MUJOCO_GL'] = 'egl'
 
-import gymnasium
 import numpy as np
 import torch
 import torch.nn as nn
 import wandb
 from tqdm import tqdm
 
-# Zermelo env imports.
-_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
-sys.path.insert(0, _repo_root)
-import zermelo_env  # noqa — registers gymnasium envs
-from zermelo_env.zermelo_config import load_config, config_to_env_kwargs
+# Make scripts/ importable for the shared helpers, and the repo root for
+# `import zermelo_env` regardless of CWD.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _SCRIPT_DIR)
+sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
+
+import _training_common as tc  # noqa: E402
+from zermelo_env.zermelo_config import load_config  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -94,41 +92,8 @@ class BCPolicy(nn.Module):
         return self.net(obs)
 
 
-# ---------------------------------------------------------------------------
-# Dataset
-# ---------------------------------------------------------------------------
-
-def load_zermelo_dataset(dataset_path, train_test_split=0.8):
-    """Load Zermelo .npz and split by episode into train/val."""
-    print(f"Loading dataset: {dataset_path}")
-    data = dict(np.load(dataset_path))
-
-    obs = data['observations'].astype(np.float32)
-    actions = data['actions'].astype(np.float32)
-    terminals = data['terminals'].astype(np.float32)
-
-    # Episode-level split.
-    ends = np.where(terminals > 0.5)[0]
-    starts = np.concatenate([[0], ends[:-1] + 1])
-    num_ep = len(starts)
-    ep_idx = np.arange(num_ep)
-    np.random.shuffle(ep_idx)
-
-    n_train = int(num_ep * train_test_split)
-    train_trans = np.concatenate([np.arange(starts[e], ends[e] + 1) for e in sorted(ep_idx[:n_train])])
-    val_trans = np.concatenate([np.arange(starts[e], ends[e] + 1) for e in sorted(ep_idx[n_train:])])
-
-    train = {'observations': obs[train_trans], 'actions': actions[train_trans]}
-    val = {'observations': obs[val_trans], 'actions': actions[val_trans]}
-
-    print(f"  Train: {len(train_trans)} transitions ({n_train} episodes)")
-    print(f"  Val:   {len(val_trans)} transitions ({num_ep - n_train} episodes)")
-    print(f"  Obs shape: {obs.shape[1:]}, Act shape: {actions.shape[1:]}")
-    return train, val
-
-
 class OfflineDataset:
-    """Simple random-batch sampler over a dict of arrays."""
+    """Random-batch sampler over a dict of arrays."""
 
     def __init__(self, data_dict, device='cpu'):
         self.data = {k: torch.tensor(v, device=device) for k, v in data_dict.items()}
@@ -143,14 +108,6 @@ class OfflineDataset:
 # Evaluation
 # ---------------------------------------------------------------------------
 
-def make_eval_env(zermelo_config_path=None):
-    cfg = load_config(zermelo_config_path)
-    env_kwargs = config_to_env_kwargs(cfg)
-    env_kwargs['fixed_start_goal'] = True
-    env_kwargs['max_episode_steps'] = cfg['run']['max_episode_steps']
-    return gymnasium.make('zermelo-pointmaze-medium-v0', **env_kwargs)
-
-
 def evaluate(policy, env, num_episodes, obs_mean, obs_std, device):
     """Run policy in env, return dict of mean metrics."""
     returns, lengths, successes = [], [], []
@@ -159,7 +116,8 @@ def evaluate(policy, env, num_episodes, obs_mean, obs_std, device):
         done = False
         ep_ret, ep_len = 0.0, 0
         while not done:
-            ob_t = torch.tensor((ob - obs_mean) / obs_std, dtype=torch.float32, device=device).unsqueeze(0)
+            ob_t = torch.tensor((ob - obs_mean) / obs_std,
+                                dtype=torch.float32, device=device).unsqueeze(0)
             with torch.no_grad():
                 action = policy(ob_t).cpu().numpy()[0]
             action = np.clip(action, -1.0, 1.0)
@@ -201,7 +159,6 @@ def main():
     parser.add_argument('--save_dir', type=str, default='exp/')
     args = parser.parse_args()
 
-    # Seeds.
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -209,10 +166,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    # Load the zermelo YAML config up front so we can log it alongside argparse flags.
     zermelo_cfg = load_config(args.zermelo_config)
-    zermelo_cfg_src = args.zermelo_config or os.path.join(
-        _repo_root, 'zermelo_config.yaml')
+    zermelo_cfg_src = tc.default_config_src_path(args.zermelo_config)
 
     # Wandb.
     exp_name = f'bc_sd{args.seed:03d}_{time.strftime("%Y%m%d_%H%M%S")}'
@@ -232,35 +187,32 @@ def main():
         json.dump(zermelo_cfg, f, indent=2)
 
     # Dataset.
-    if args.zermelo_dataset is None:
-        args.zermelo_dataset = os.path.join(_repo_root, zermelo_cfg['run']['save_path'])
-
-    train_data, val_data = load_zermelo_dataset(args.zermelo_dataset)
+    dataset_path = args.zermelo_dataset or tc.default_dataset_path(zermelo_cfg)
+    data, train_segs, val_segs = tc.load_episode_segments(dataset_path)
+    train_flat = tc.flatten_segments(data, train_segs, ['observations', 'actions'])
+    val_flat = tc.flatten_segments(data, val_segs, ['observations', 'actions'])
 
     # Observation normalization.
-    obs_mean = train_data['observations'].mean(axis=0)
-    obs_std = train_data['observations'].std(axis=0) + 1e-6
-    train_data['observations'] = (train_data['observations'] - obs_mean) / obs_std
-    val_data['observations'] = (val_data['observations'] - obs_mean) / obs_std
-    np.savez(os.path.join(save_dir, 'obs_norm_stats.npz'), obs_mean=obs_mean, obs_std=obs_std)
+    obs_mean, obs_std = tc.compute_obs_norm(train_flat['observations'])
+    train_flat['observations'] = (train_flat['observations'] - obs_mean) / obs_std
+    val_flat['observations'] = (val_flat['observations'] - obs_mean) / obs_std
+    tc.save_obs_norm(save_dir, obs_mean, obs_std)
 
-    train_ds = OfflineDataset(train_data, device)
-    val_ds = OfflineDataset(val_data, device)
+    train_ds = OfflineDataset(train_flat, device)
+    val_ds = OfflineDataset(val_flat, device)
 
     # Model.
-    obs_dim = train_data['observations'].shape[1]
-    act_dim = train_data['actions'].shape[1]
+    obs_dim = train_flat['observations'].shape[1]
+    act_dim = train_flat['actions'].shape[1]
     policy = BCPolicy(obs_dim, act_dim, hidden_dims=args.hidden_dims).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.lr)
     print(f"Policy params: {sum(p.numel() for p in policy.parameters()):,}")
 
-    # Eval env.
-    eval_env = make_eval_env(args.zermelo_config)
+    eval_env = tc.make_eval_env(args.zermelo_config)
 
     # Training.
     first_time = time.time()
     last_time = time.time()
-
     for step in tqdm(range(1, args.train_steps + 1), desc="BC Training", dynamic_ncols=True):
         batch = train_ds.sample(args.batch_size)
         pred_actions = policy(batch['observations'])
@@ -270,35 +222,31 @@ def main():
         loss.backward()
         optimizer.step()
 
-        # Log.
         if step % args.log_interval == 0:
             with torch.no_grad():
                 val_batch = val_ds.sample(args.batch_size)
-                val_loss = nn.functional.mse_loss(policy(val_batch['observations']), val_batch['actions']).item()
-
-            metrics = {
+                val_loss = nn.functional.mse_loss(
+                    policy(val_batch['observations']), val_batch['actions']).item()
+            wandb.log({
                 'training/loss': loss.item(),
                 'validation/loss': val_loss,
                 'time/epoch_time': (time.time() - last_time) / args.log_interval,
                 'time/total_time': time.time() - first_time,
-            }
-            wandb.log(metrics, step=step)
+            }, step=step)
             last_time = time.time()
 
-        # Eval.
         if step % args.eval_interval == 0:
             policy.eval()
-            eval_info = evaluate(policy, eval_env, args.eval_episodes, obs_mean, obs_std, device)
+            eval_info = evaluate(policy, eval_env, args.eval_episodes,
+                                 obs_mean, obs_std, device)
             policy.train()
-            eval_metrics = {f'evaluation/{k}': v for k, v in eval_info.items()}
-            wandb.log(eval_metrics, step=step)
+            wandb.log({f'evaluation/{k}': v for k, v in eval_info.items()}, step=step)
             print(f"  Step {step}: return={eval_info['episode.return']:.2f}, "
-                  f"success={eval_info['success']:.2f}, length={eval_info['episode.length']:.0f}")
+                  f"success={eval_info['success']:.2f}, "
+                  f"length={eval_info['episode.length']:.0f}")
 
-        # Save.
         if step % args.save_interval == 0:
-            ckpt_path = os.path.join(save_dir, f'policy_{step}.pt')
-            torch.save(policy.state_dict(), ckpt_path)
+            torch.save(policy.state_dict(), os.path.join(save_dir, f'policy_{step}.pt'))
 
     wandb.finish()
     print("Done.")
