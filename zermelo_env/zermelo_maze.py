@@ -329,6 +329,21 @@ def make_zermelo_maze_env(*args, **kwargs):
                     conaffinity='0',
                 )
 
+            # Add a small dot at each sensor position.
+            if self._sensor_positions is not None:
+                for si, (sx, sy) in enumerate(self._sensor_positions):
+                    ET.SubElement(
+                        worldbody,
+                        'geom',
+                        name=f'sensor_dot_{si}',
+                        type='cylinder',
+                        size='.07 .02',
+                        pos=f'{sx} {sy} 0.06',
+                        rgba='0.2 0.9 0.9 0.7',
+                        contype='0',
+                        conaffinity='0',
+                    )
+
             if self._show_action_arrow:
                 # Shaft = thin cylinder, head = stubby fat cylinder at the tip.
                 # Both lie horizontally (rotated to point along the action),

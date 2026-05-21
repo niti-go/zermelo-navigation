@@ -35,8 +35,13 @@ flow:
   frames_per_step: 5
   target_max: 2.3                 # rescale peak velocity (agent max ≈ 2.83)
   n_tiles: 1.0                    # native-box copies tiling the arena
-  train_max_file: 9
-  start_frame_mode: deterministic_spread   # 'deterministic_spread' | 'random'
+  train_max_file: 44
+  # How episode start frames are assigned within the train segment:
+  #   'deterministic_spread' — one unique frame per episode, sweeping the full range
+  #   'random'               — i.i.d. uniform draw each episode
+  #   <int> N                — exactly N evenly-spaced frames, cycled: episode i
+  #                            uses frame i % N  (e.g. 10 for ten initial conditions)
+  start_frame_mode: 10
 
 # --- Observation & dynamics ------------------------------------------------
 observation:
@@ -75,7 +80,7 @@ run:
   seed: 0
   num_episodes: 20000
   max_episode_steps: 1000
-  save_path: datasets/10flowfiles_straightpath.npz
+  save_path: datasets/10initialconditions_straightpath.npz
 
 # Diversity controls — only used by generate_dataset.py (the diverse
 # generator). The straight-line oracle ignores this block entirely.

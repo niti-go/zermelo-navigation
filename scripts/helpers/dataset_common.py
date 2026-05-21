@@ -89,9 +89,12 @@ def sample_start_frame(env, cfg, global_idx, num_episodes):
     """Per-episode flow start frame within the train segment.
 
     Mode selected by `flow.start_frame_mode`:
-      - 'deterministic_spread' (default): uniform sweep across the train
-        segment using the global episode index.
-      - 'random': i.i.d. uniform in the valid range.
+      - 'deterministic_spread' (default): one unique start frame per episode,
+        sweeping uniformly across the train segment.
+      - 'random': i.i.d. uniform draw in the valid range.
+      - <int> N: exactly N evenly-spaced start frames, cycled across episodes
+        (episode i uses frame at index i % N). Use this to fix the number of
+        distinct initial flow conditions regardless of dataset size.
     """
     upper = start_frame_upper(env, cfg)
     mode = cfg['flow'].get('start_frame_mode', 'deterministic_spread')
@@ -101,8 +104,14 @@ def sample_start_frame(env, cfg, global_idx, num_episodes):
         return float(np.random.uniform(0.0, upper))
     if mode == 'deterministic_spread':
         return deterministic_start_frame(global_idx, num_episodes, upper)
+    if isinstance(mode, int):
+        n = max(1, mode)
+        if upper <= 0 or n == 1:
+            return 0.0
+        fixed_frames = np.linspace(0.0, upper, n)
+        return float(fixed_frames[global_idx % n])
     raise ValueError(f"Unknown flow.start_frame_mode={mode!r}; "
-                     f"expected 'deterministic_spread' or 'random'.")
+                     f"expected 'deterministic_spread', 'random', or an integer.")
 
 
 def worker_frame_range(cfg, start_idx, n_episodes, num_episodes_total,
@@ -117,6 +126,9 @@ def worker_frame_range(cfg, start_idx, n_episodes, num_episodes_total,
     max_steps = int(cfg['run']['max_episode_steps'])
     span = max_steps * fps
     upper = max(0.0, float(n_train_frames) - span)
+    if isinstance(mode, int):
+        # Fixed-N mode can cycle over any of the N frames, so return full range.
+        return (0.0, float(n_train_frames))
     if mode != 'deterministic_spread' or num_episodes_total <= 1 or upper <= 0:
         return (0.0, float(n_train_frames))
     last_idx = min(num_episodes_total - 1, start_idx + n_episodes - 1)
