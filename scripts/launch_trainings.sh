@@ -3,8 +3,8 @@
 # sessions, each pinned to a different GPU.
 #
 # Picks the N least-loaded GPUs (sorted by memory.used ascending) from
-# `nvidia-smi`. Refuses to clobber an existing tmux session with the same
-# name — kill it first if you want a fresh run.
+# `nvidia-smi`. Kills any existing tmux sessions with the same names before
+# launching fresh ones.
 #
 # Usage:
 #   bash scripts/launch_trainings.sh
@@ -70,12 +70,11 @@ BC_GPU="${GPUS[0]}"
 DT_GPU="${GPUS[1]}"
 MFQL_GPU="${GPUS[2]}"
 
-# Refuse to clobber existing sessions.
+# Kill existing sessions so we can start fresh.
 for name in bc_zermelo dt_zermelo mfql_zermelo; do
     if tmux has-session -t "$name" 2>/dev/null; then
-        echo "ERROR: tmux session '$name' already exists. Kill it first:" >&2
-        echo "    tmux kill-session -t $name" >&2
-        exit 1
+        echo "Killing existing tmux session '$name'..."
+        tmux kill-session -t "$name"
     fi
 done
 

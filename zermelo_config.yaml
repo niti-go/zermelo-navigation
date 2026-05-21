@@ -15,6 +15,16 @@ maze:
     - [1, 0, 0, 0, 1, 0, 0, 1]
     - [1, 1, 1, 1, 1, 1, 1, 1]
 
+# --- Sensors ----------------------------------------------------------------
+# Grid of evenly-spaced flow sensors added to the agent's observation.
+# null = disabled (default). Set to [N, M] for an N×M grid, e.g. [10, 10].
+# When enabled, 2*N*M extra values (vx, vy at each sensor) are appended to
+# the state vector after [x, y, flow_vx, flow_vy, goal_x, goal_y].
+# Sensors cover the full flow arena (flow.x_range × flow.y_range).
+# Changing this requires regenerating any existing dataset.
+sensors:
+  grid: null
+
 # --- Flow field (chained HIT snapshots) ------------------------------------
 # HIT1..HIT{train_max_file} form one continuous clip; each env step advances
 # `frames_per_step` snapshots. HIT{train_max_file+1}..HIT49 are held out.
@@ -25,7 +35,7 @@ flow:
   frames_per_step: 5
   target_max: 2.3                 # rescale peak velocity (agent max ≈ 2.83)
   n_tiles: 1.0                    # native-box copies tiling the arena
-  train_max_file: 45
+  train_max_file: 9
   start_frame_mode: deterministic_spread   # 'deterministic_spread' | 'random'
 
 # --- Observation & dynamics ------------------------------------------------
@@ -65,7 +75,7 @@ run:
   seed: 0
   num_episodes: 20000
   max_episode_steps: 1000
-  save_path: datasets/straight_oracle_20k.npz
+  save_path: datasets/10flowfiles_straightpath.npz
 
 # Diversity controls — only used by generate_dataset.py (the diverse
 # generator). The straight-line oracle ignores this block entirely.

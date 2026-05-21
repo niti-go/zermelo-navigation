@@ -60,6 +60,7 @@ def make_zermelo_maze_env(*args, **kwargs):
             drift_threshold=0.01,
             goal_tolerance=1.0,
             show_action_arrow=False,
+            sensor_grid=None,
             *args,
             **kwargs,
         ):
@@ -103,6 +104,20 @@ def make_zermelo_maze_env(*args, **kwargs):
 
             assert ob_type in ['states', 'pixels']
             assert success_timing in ['pre', 'post']
+
+            # Precompute sensor grid positions in world coords.
+            # Must be set before super().__init__() since get_ob() can fire early.
+            if sensor_grid is not None:
+                nx, ny = int(sensor_grid[0]), int(sensor_grid[1])
+                x_range = hit_flow_cfg.get('x_range', [-4.0, 24.0])
+                y_range = hit_flow_cfg.get('y_range', [-4.0, 24.0])
+                xs = np.linspace(x_range[0], x_range[1], nx)
+                ys = np.linspace(y_range[0], y_range[1], ny)
+                self._sensor_positions = np.array(
+                    [(x, y) for x in xs for y in ys], dtype=np.float64
+                )
+            else:
+                self._sensor_positions = None
 
             # Define constants.
             self._offset_x = 4
@@ -589,8 +604,16 @@ def make_zermelo_maze_env(*args, **kwargs):
         def get_ob(self, ob_type=None):
             ob_type = self._ob_type if ob_type is None else ob_type
             if ob_type == 'states':
-                base_ob = super().get_ob()  # [qpos_x, qpos_y, flow_vx, flow_vy]
-                return np.concatenate([base_ob, self.cur_goal_xy])
+                base_ob = super().get_ob()  # [x, y, flow_vx, flow_vy]
+                ob = np.concatenate([base_ob, self.cur_goal_xy])
+                if self._sensor_positions is not None:
+                    readings = np.array(
+                        [v for sx, sy in self._sensor_positions
+                         for v in self._flow_field.get_flow(sx, sy, self._frame)],
+                        dtype=np.float64,
+                    )
+                    ob = np.concatenate([ob, readings])
+                return ob
             else:
                 return self.render()
 

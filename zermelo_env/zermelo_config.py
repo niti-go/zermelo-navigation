@@ -110,4 +110,5 @@ def config_to_env_kwargs(cfg, max_file=None):
         add_noise_to_goal=task_cfg['noise_on_reset'],
         add_noise_to_start=task_cfg['noise_on_reset'],
         show_action_arrow=cfg['env'].get('show_action_arrow', False),
+        sensor_grid=cfg.get('sensors', {}).get('grid', None),
     )
