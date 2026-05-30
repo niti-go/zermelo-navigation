@@ -3,8 +3,7 @@
 For each episode, samples a random (start, goal) and runs all three policies
 on that same pair. Each eval segment ('heldout' / 'train') pins the flow-clock
 start frame inside its segment so policies are tested on the flow regime we
-intend (HIT46..HIT49 are reserved by `flow.train_max_file` and were never
-seen at dataset-generation time).
+intend (train_max_file divides training vs. held-out flow).
 
 Everything is configured by the constants at the top of the file.
 
@@ -26,6 +25,57 @@ Outputs
         videos/                # one stitched mp4 per recorded episode
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# User config — edit these, then run.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Which training project / runs to evaluate. RUN_TAG=None auto-picks the most
+# recent run dir under exp/<EXP_PROJECT>/<algo>/.
+EXP_PROJECT        = None  # set from cfg['wandb_project_name'] in main()
+RUN_TAG            = None
+DEVICE             = 'cuda'
+SEED               = 42
+
+# GPU: pinned device id (e.g. '0', '0,1') or None to auto-pick least-loaded.
+# Priority: env-var override (`CUDA_VISIBLE_DEVICES=0 python …`) > this > auto.
+CUDA_VISIBLE_DEVICES = None
+
+# How many episodes to evaluate per segment, and how many of those to record as videos.
+NUM_EVAL_EPISODES  = 200
+NUM_VIDEO_EPISODES = 3
+
+# Flow segments to evaluate. Any subset of ('heldout', 'train'):
+#   'heldout' — start_frames in [n_train_frames, n_total_frames). Never seen
+#               during training. This is the primary evaluation.
+#   'train'   — start_frames matching the dataset's initial_flow_conditions.
+#               Sanity check / generalization gap comparison.
+EVAL_FLOW_SEGMENTS = ('heldout', 'train')
+
+# How start_frames are scheduled for the held-out segment.
+# (Train segment always mirrors the dataset's flow.initial_flow_conditions.)
+#   'deterministic_spread' — linspace across the held-out segment
+#   'random'               — uniform random (seeded)
+START_FRAME_MODE   = 'deterministic_spread'
+
+# Per-algo checkpoint selection.
+#   'last'      — highest step number
+#   'best_eval' — read eval.csv and pick by success rate then return;
+#                 falls back to 'last' if no csv.
+#   int         — explicit step number
+CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval'}
+
+# Whether to plot the offline-dataset return distribution alongside policy
+# returns. The dataset was generated on training flow only; comparing held-out
+# eval to it is intentional (it's the demonstration distribution the policies
+# learned from).
+COMPARE_TO_OFFLINE_DATASET = True
+
+# Rendering / I/O.
+RENDER_SIZE        = 200
+VIDEO_FPS          = 30
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 import csv
 import glob
 import json
@@ -39,12 +89,6 @@ from datetime import datetime
 os.environ['PYOPENGL_PLATFORM'] = 'egl'
 os.environ['MUJOCO_GL'] = 'egl'
 os.environ['XLA_PYTHON_CLIENT_PREALLOCATE'] = 'false'
-
-# ── GPU selection (applied before torch/jax import) ────────────────────────
-# Pinned device id (e.g. '0', '0,1') or None to auto-pick the least-loaded GPU.
-# Priority: env-var override (`CUDA_VISIBLE_DEVICES=0 python …`) > this
-# constant > auto-pick.
-CUDA_VISIBLE_DEVICES = None
 
 
 def _pick_free_gpu():
@@ -90,60 +134,28 @@ from zermelo_env.zermelo_config import (
 )
 from zermelo_env.hit_chain import HITChainFlow
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# User config — edit these, then run.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# (For GPU selection, see CUDA_VISIBLE_DEVICES at the top of this file.)
-
-# Which training project / runs to evaluate. RUN_TAG=None auto-picks the most
-# recent run dir under exp/<EXP_PROJECT>/<algo>/.
-EXP_PROJECT        = 'straight_general_v1'
-RUN_TAG            = None
-DEVICE             = 'cuda'
-SEED               = 42
-
-# How many episodes to evaluate per segment, and how many of those to record as videos.
-NUM_EVAL_EPISODES  = 200
-NUM_VIDEO_EPISODES = 3
-
-# Flow segments to evaluate. Any subset of ('heldout', 'train'):
-#   'heldout' — start_frames in [n_train_frames, n_total_frames). Reserved by
-#               flow.train_max_file. This is the primary evaluation.
-#   'train'   — start_frames in [0, n_train_frames). Sanity check / generalization
-#               gap comparison.
-EVAL_FLOW_SEGMENTS = ('heldout', 'train')
-
-# How start_frames are scheduled within a segment. Mirrors dataset gen.
-#   'deterministic_spread' — linspace across the segment
-#   'random'               — uniform random (seeded)
-START_FRAME_MODE   = 'deterministic_spread'
-
-# Per-algo checkpoint selection.
-#   'last'      — highest step number
-#   'best_eval' — read eval.csv (MFQL only) and pick the step with highest
-#                 evaluation/episode.return; falls back to 'last' if no csv.
-#   int         — explicit step number
-CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval'}
-
-# Whether to plot the offline-dataset return distribution alongside policy
-# returns. The dataset was generated on training flow only; comparing held-out
-# eval to it is intentional (it's the demonstration distribution the policies
-# learned from).
-COMPARE_TO_OFFLINE_DATASET = True
-
-# Rendering / I/O.
-RENDER_SIZE        = 200
-VIDEO_FPS          = 30
-RESULTS_ROOT       = os.path.join(_REPO_ROOT, 'results')
-
+RESULTS_ROOT = os.path.join(_REPO_ROOT, 'results')
 
 # Visual constants (changing these only affects plots, not eval).
 ALGO_ORDER  = ('BC', 'DT', 'MeanFlowQL')
 ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c'}
-SEGMENT_LABEL = {'heldout': 'Held-out flow (HIT46..HIT49)',
-                 'train':   'Training flow (HIT1..HIT45)'}
+
+
+def _make_segment_labels(cfg):
+    """Build SEGMENT_LABEL dynamically from train_max_file in the config."""
+    flow_cfg = cfg['flow']
+    train_max = int(flow_cfg.get('train_max_file', 0))
+    nc_dir = flow_cfg['nc_dir']
+    if not os.path.isabs(nc_dir):
+        nc_dir = os.path.join(_REPO_ROOT, nc_dir)
+    total = len(glob.glob(os.path.join(nc_dir, 'HIT*.nc')))
+    return {
+        'train':   f'Training flow (HIT1..HIT{train_max})',
+        'heldout': f'Held-out flow (HIT{train_max + 1}..HIT{total})',
+    }
+
+# Populated at runtime once the config is loaded (see main()).
+SEGMENT_LABEL = {'heldout': 'Held-out flow', 'train': 'Training flow'}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,9 +244,17 @@ def find_run_dir(algo):
 
 
 def select_checkpoint(run_dir, algo, policy):
-    files = sorted(glob.glob(os.path.join(run_dir, _CKPT_GLOB[algo])))
-    if not files:
+    all_files = sorted(glob.glob(os.path.join(run_dir, _CKPT_GLOB[algo])))
+    if not all_files:
         raise FileNotFoundError(f'No {_CKPT_GLOB[algo]} in {run_dir}')
+
+    # Drop empty/corrupted files so we never load a 0-byte checkpoint.
+    files = [f for f in all_files if os.path.getsize(f) > 0]
+    if not files:
+        raise FileNotFoundError(f'All checkpoints in {run_dir} are empty.')
+    dropped = len(all_files) - len(files)
+    if dropped:
+        print(f'  [{algo}] skipping {dropped} empty checkpoint(s)')
 
     if isinstance(policy, int):
         match = [f for f in files if _step_of(f) == policy]
@@ -255,8 +275,19 @@ def select_checkpoint(run_dir, algo, policy):
         valid = [r for r in rows if r.get('evaluation/episode.return', '') != '']
         if not valid:
             return max(files, key=_step_of)
-        best = max(valid, key=lambda r: float(r['evaluation/episode.return']))
+        # Rank by success rate first; break ties by episode return.
+        # This prevents a near-zero-action random init from winning on return
+        # alone when trained checkpoints have higher energy costs but actually
+        # reach the goal.
+        def _rank(r):
+            success = float(r.get('evaluation/success', 0.0))
+            ret     = float(r.get('evaluation/episode.return', -1e9))
+            return (success, ret)
+        best = max(valid, key=_rank)
         best_step = int(float(best['step']))
+        print(f'  [{algo}] best_eval → step {best_step} '
+              f'(success={float(best.get("evaluation/success", 0)):.2f}, '
+              f'return={float(best["evaluation/episode.return"]):.1f})')
         match = [f for f in files if _step_of(f) == best_step]
         if match:
             return match[0]
@@ -507,19 +538,33 @@ def episode_start_frames(segment, n_episodes, cfg, env):
 
     hi_safe = max(lo, hi_full - span)
     can_avoid_wrap = hi_safe > lo
-    hi = hi_safe if can_avoid_wrap else hi_full
+    # When the segment is shorter than one episode, the only safe start is lo
+    # itself (the segment boundary). Using any later start would run into the
+    # adjacent segment's flow. We pin hi = lo so all modes land on lo.
+    hi = hi_safe if can_avoid_wrap else lo
     wraps = not can_avoid_wrap
+    if wraps:
+        print(f'  ⚠ [{segment}] segment shorter than one episode — '
+              f'all start frames pinned to frame {lo:.0f}')
 
-    if START_FRAME_MODE == 'random':
+    # For the train segment, honour the dataset's initial_flow_conditions so eval
+    # lands on the same initial conditions the policies were trained on.
+    mode = START_FRAME_MODE if segment == 'heldout' else cfg['flow'].get('initial_flow_conditions', START_FRAME_MODE)
+
+    if mode == 'random':
         rng = np.random.default_rng(SEED + hash(segment) % (2**31))
         starts = rng.uniform(lo, hi, size=n_episodes)
-    elif START_FRAME_MODE == 'deterministic_spread':
+    elif mode == 'deterministic_spread':
         if n_episodes <= 1 or hi <= lo:
             starts = np.full(n_episodes, lo, dtype=np.float64)
         else:
             starts = np.linspace(lo, hi, n_episodes)
+    elif isinstance(mode, int):
+        n = max(1, mode)
+        fixed = np.linspace(lo, min(hi, hi_safe) if can_avoid_wrap else hi, n) if n > 1 else np.array([lo])
+        starts = np.array([fixed[i % n] for i in range(n_episodes)], dtype=np.float64)
     else:
-        raise ValueError(f'Unknown START_FRAME_MODE: {START_FRAME_MODE!r}')
+        raise ValueError(f'Unknown START_FRAME_MODE: {mode!r}')
 
     return starts.astype(np.float64), wraps
 
@@ -560,7 +605,7 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
     done = False
     ep_ret = 0.0
     action_effort = 0.0
-    traj, frames = [], []
+    traj, frames, step_rewards = [], [], []
     info = {}
     while not done:
         traj.append([float(obs[0]), float(obs[1])])
@@ -570,6 +615,7 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
         action_effort += float(np.linalg.norm(action))
         obs, reward, terminated, truncated, info = env.step(action)
         policy.observe_reward(reward)
+        step_rewards.append(float(reward))
         done = terminated or truncated
         ep_ret += reward
 
@@ -581,6 +627,7 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
         'init_dist':     init_dist,
         'final_dist':    float(info.get('dist_to_goal', float('nan'))),
         'trajectory':    traj,
+        'step_rewards':  step_rewards,
         'frames':        frames,
     }
 
@@ -592,7 +639,7 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
 def _dataset_episode_metrics(cfg):
     """Per-episode return / success / length / mean ||a|| from the offline .npz.
     Returns None if the dataset isn't present."""
-    p = os.path.join(_REPO_ROOT, cfg['run']['save_path'])
+    p = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
     if not os.path.exists(p):
         return None
     data = np.load(p)
@@ -620,6 +667,23 @@ def _dataset_max_return(dataset_path):
     ends = np.where(terminals > 0.5)[0]
     starts = np.concatenate([[0], ends[:-1] + 1])
     return float(max(rewards[s:e + 1].sum() for s, e in zip(starts, ends)))
+
+
+def _offline_sample_step_rewards(cfg, n_episodes=2, seed=42):
+    """Return n_episodes randomly chosen offline episodes as lists of per-step rewards."""
+    p = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
+    if not os.path.exists(p):
+        return None
+    data = np.load(p)
+    rewards = data['rewards'].astype(np.float64)
+    terminals = data['terminals'].astype(np.float32)
+    ends = np.where(terminals > 0.5)[0]
+    if len(ends) < n_episodes:
+        return None
+    starts = np.concatenate([[0], ends[:-1] + 1])
+    rng = np.random.default_rng(seed)
+    idxs = rng.choice(len(ends), size=n_episodes, replace=False)
+    return [rewards[int(starts[i]):int(ends[i]) + 1].tolist() for i in idxs]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -750,7 +814,7 @@ def plot_return_histogram(results, cfg, segment, out_path):
         all_r = all_r + ds['return'].tolist()
     if not all_r:
         return
-    lo = max(-300.0, float(np.min(all_r)))
+    lo = float(np.min(all_r))
     hi = max(float(np.max(all_r)), lo + 1.0)
     bins = np.linspace(lo, hi, 51)
 
@@ -772,13 +836,13 @@ def plot_return_histogram(results, cfg, segment, out_path):
     if len(panels) == 1:
         axes = [axes]
     for ax, (_, rs, color, title) in zip(axes, panels):
-        ax.hist(np.clip(rs, lo, hi), bins=bins, color=color, alpha=0.85,
+        ax.hist(rs, bins=bins, color=color, alpha=0.85,
                 edgecolor='black', linewidth=0.4)
         ax.set_xlim(lo, hi)
         ax.set_ylabel('Episodes')
         ax.set_title(title, loc='left', fontsize=11)
         ax.grid(True, alpha=0.3, axis='y')
-    axes[-1].set_xlabel('Episode return  (clipped to ≥ −300 for readability)')
+    axes[-1].set_xlabel('Episode return')
     fig.suptitle(f'Return distribution — {SEGMENT_LABEL[segment]}', fontsize=13)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches='tight')
@@ -874,6 +938,61 @@ def plot_train_vs_heldout(by_segment, out_path):
     plt.close(fig)
 
 
+def plot_reward_trajectories(by_segment, cfg, out_path, seed=42):
+    """4×4 grid: rows = [Offline, BC, DT, MeanFlowQL], columns = [ep1 instant,
+    ep1 cumulative, ep2 instant, ep2 cumulative]. Shows how reward evolves over
+    steps for 2 randomly sampled episodes from each source."""
+    segment = 'heldout' if 'heldout' in by_segment else list(by_segment.keys())[0]
+    results = by_segment[segment]
+    rng = np.random.default_rng(seed)
+
+    offline_eps = _offline_sample_step_rewards(cfg, n_episodes=2, seed=seed)
+
+    # Build (label, color, [step_rewards_ep0, step_rewards_ep1]) tuples.
+    sources = []
+    if offline_eps is not None:
+        sources.append(('Offline dataset\n(train flow)', '#7f7f7f', offline_eps))
+    for algo in ALGO_ORDER:
+        eps = results[algo]
+        idxs = rng.choice(len(eps), size=2, replace=False)
+        sources.append((algo, ALGO_COLORS[algo],
+                        [eps[i]['step_rewards'] for i in idxs]))
+
+    n_rows = len(sources)
+    fig, axes = plt.subplots(n_rows, 4,
+                             figsize=(16, n_rows * 2.8),
+                             squeeze=False)
+
+    col_titles = ['Episode 1 — instantaneous reward',
+                  'Episode 1 — cumulative reward',
+                  'Episode 2 — instantaneous reward',
+                  'Episode 2 — cumulative reward']
+    for j, title in enumerate(col_titles):
+        axes[0, j].set_title(title, fontsize=9, fontweight='bold')
+
+    for i, (label, color, ep_pair) in enumerate(sources):
+        axes[i, 0].set_ylabel(label, fontsize=9)
+        for ep_idx, step_rewards in enumerate(ep_pair):
+            sr = np.array(step_rewards)
+            steps = np.arange(len(sr))
+            cumul = np.cumsum(sr)
+            ax_i = axes[i, ep_idx * 2]
+            ax_c = axes[i, ep_idx * 2 + 1]
+            ax_i.plot(steps, sr, color=color, linewidth=1.0)
+            ax_i.axhline(0, color='black', linewidth=0.5, linestyle='--', alpha=0.4)
+            ax_i.set_xlabel('Step', fontsize=8)
+            ax_i.grid(True, alpha=0.3)
+            ax_c.plot(steps, cumul, color=color, linewidth=1.2)
+            ax_c.set_xlabel('Step', fontsize=8)
+            ax_c.grid(True, alpha=0.3)
+
+    fig.suptitle(f'Per-step reward trajectories — policy episodes from {SEGMENT_LABEL[segment]}',
+                 fontsize=12)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Video helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -950,8 +1069,11 @@ def main():
 
     # ── Config + env ────────────────────────────────────────────────────────
     cfg = load_config(None)
+    global EXP_PROJECT, SEGMENT_LABEL
+    EXP_PROJECT = cfg['wandb_project_name']
+    SEGMENT_LABEL = _make_segment_labels(cfg)
     device = torch.device(DEVICE)
-    dataset_path = os.path.join(_REPO_ROOT, cfg['run']['save_path'])
+    dataset_path = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
 
     # ── Load policies ───────────────────────────────────────────────────────
     print('\nLoading policies…')
@@ -1039,15 +1161,14 @@ def main():
                         os.path.join(plots_dir, f'comparison_{segment}.png'))
         plot_return_histogram(results, cfg, segment,
                               os.path.join(plots_dir, f'return_histogram_{segment}.png'))
-        plot_success_vs_init_dist(results, segment,
-                                  os.path.join(plots_dir, f'success_vs_init_dist_{segment}.png'))
-        plot_energy_vs_return(results, segment,
-                              os.path.join(plots_dir, f'energy_vs_return_{segment}.png'))
 
     # ── Cross-segment plot ──────────────────────────────────────────────────
     if 'train' in by_segment and 'heldout' in by_segment:
         plot_train_vs_heldout(
             by_segment, os.path.join(plots_dir, 'train_vs_heldout.png'))
+
+    plot_reward_trajectories(by_segment, cfg,
+                             os.path.join(plots_dir, 'reward_trajectories.png'))
 
     # ── Persist metrics + manifest ──────────────────────────────────────────
     metrics_rows = []
@@ -1082,9 +1203,12 @@ def main():
         json.dump(metrics_rows, f, indent=2)
     print(f'\nWrote {csv_path}')
 
-    # Raw per-episode dicts (no frames) — sometimes useful for ad-hoc analysis.
+    # Raw per-episode dicts (no frames or step_rewards) — for ad-hoc analysis.
+    _strip = {'frames', 'step_rewards'}
     with open(os.path.join(out_dir, 'raw_episodes.json'), 'w') as f:
-        json.dump({s: {a: results_for_a for a, results_for_a in by_segment[s].items()}
+        json.dump({s: {a: [{k: v for k, v in ep.items() if k not in _strip}
+                            for ep in results_for_a]
+                       for a, results_for_a in by_segment[s].items()}
                    for s in by_segment}, f)
 
     # Manifest: everything needed to reproduce this run.
@@ -1096,7 +1220,7 @@ def main():
         'num_eval_episodes':   NUM_EVAL_EPISODES,
         'num_video_episodes':  NUM_VIDEO_EPISODES,
         'eval_flow_segments':  list(EVAL_FLOW_SEGMENTS),
-        'start_frame_mode':    START_FRAME_MODE,
+        'initial_flow_conditions':    START_FRAME_MODE,
         'checkpoint_policy':   CHECKPOINT_POLICY,
         'compare_to_offline_dataset': COMPARE_TO_OFFLINE_DATASET,
         'device':              DEVICE,

@@ -399,7 +399,7 @@ def main(_):
     print(f'  progress_weight  ≈ 0.5 / (typical_start_distance ~ 15) ≈ 0.03   '
           f'(scale-invariant: total = progress_weight × travelled_distance)\n')
 
-    dc.save_dataset(dataset, run_cfg['save_path'])
+    dc.save_dataset(dataset, cfg['dataset_save_path'])
 
 
 if __name__ == '__main__':

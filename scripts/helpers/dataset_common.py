@@ -88,7 +88,7 @@ def deterministic_start_frame(global_idx, num_episodes, upper):
 def sample_start_frame(env, cfg, global_idx, num_episodes):
     """Per-episode flow start frame within the train segment.
 
-    Mode selected by `flow.start_frame_mode`:
+    Mode selected by `flow.initial_flow_conditions`:
       - 'deterministic_spread' (default): one unique start frame per episode,
         sweeping uniformly across the train segment.
       - 'random': i.i.d. uniform draw in the valid range.
@@ -97,7 +97,7 @@ def sample_start_frame(env, cfg, global_idx, num_episodes):
         distinct initial flow conditions regardless of dataset size.
     """
     upper = start_frame_upper(env, cfg)
-    mode = cfg['flow'].get('start_frame_mode', 'deterministic_spread')
+    mode = cfg['flow'].get('initial_flow_conditions', 'deterministic_spread')
     if mode == 'random':
         if upper <= 0:
             return 0.0
@@ -110,7 +110,7 @@ def sample_start_frame(env, cfg, global_idx, num_episodes):
             return 0.0
         fixed_frames = np.linspace(0.0, upper, n)
         return float(fixed_frames[global_idx % n])
-    raise ValueError(f"Unknown flow.start_frame_mode={mode!r}; "
+    raise ValueError(f"Unknown flow.initial_flow_conditions={mode!r}; "
                      f"expected 'deterministic_spread', 'random', or an integer.")
 
 
@@ -119,9 +119,9 @@ def worker_frame_range(cfg, start_idx, n_episodes, num_episodes_total,
     """Tightest [frame_lo, frame_hi) the worker will ever access.
 
     Used to prewarm only the slab of HIT pages this worker will touch.
-    Falls back to the full range under `start_frame_mode='random'`.
+    Falls back to the full range under `initial_flow_conditions='random'`.
     """
-    mode = cfg['flow'].get('start_frame_mode', 'deterministic_spread')
+    mode = cfg['flow'].get('initial_flow_conditions', 'deterministic_spread')
     fps = float(cfg['flow'].get('frames_per_step', 1.0))
     max_steps = int(cfg['run']['max_episode_steps'])
     span = max_steps * fps

@@ -16,7 +16,7 @@
 #   BC_STEPS    — BC train_steps                        (default 500000)
 #   DT_STEPS    — DT train_steps                        (default 500000)
 #   MFQL_STEPS  — MeanFlowQL offline_steps              (default 1000000)
-#   PROJ_WANDB  — wandb project                         (default "zermelo")
+#   PROJ_WANDB  — wandb project                         (default: wandb_project_name from zermelo_config.yaml)
 #
 # Wandb entity is always RL_Control_JX (not configurable here).
 #
@@ -28,7 +28,7 @@ SEED="${SEED:-0}"
 BC_STEPS="${BC_STEPS:-500000}"
 DT_STEPS="${DT_STEPS:-500000}"
 MFQL_STEPS="${MFQL_STEPS:-1000000}"
-PROJ_WANDB="${PROJ_WANDB:-zermelo}"
+PROJ_WANDB="${PROJ_WANDB:-$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO_ROOT/zermelo_config.yaml'))['wandb_project_name'])")}"
 WANDB_ENTITY="RL_Control_JX"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -116,12 +116,12 @@ launch mfql_zermelo "$MFQL_GPU" "$LOG_DIR/mfql_${TIMESTAMP}.log" \
 echo
 echo "All sessions launched."
 echo
-echo "Attach with:"
+echo "Reattach to a session:"
 echo "  tmux attach -t bc_zermelo"
 echo "  tmux attach -t dt_zermelo"
 echo "  tmux attach -t mfql_zermelo"
 echo
-echo "Detach from a session with Ctrl-b then d."
+echo "Detach from a session (leave it running): Ctrl-b then d."
 echo "Tail logs from anywhere:"
 echo "  tail -f $LOG_DIR/bc_${TIMESTAMP}.log"
 echo

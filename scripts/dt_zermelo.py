@@ -259,7 +259,7 @@ def main():
     parser.add_argument('--log_interval', type=int, default=5000)
     parser.add_argument('--zermelo_dataset', type=str, default=None)
     parser.add_argument('--zermelo_config', type=str, default=None)
-    parser.add_argument('--proj_wandb', type=str, default='zermelo')
+    parser.add_argument('--proj_wandb', type=str, default=None)
     parser.add_argument('--run_group', type=str, default='dt')
     parser.add_argument('--wandb_entity', type=str, default='RL_Control_JX')
     parser.add_argument('--wandb_online', type=bool, default=True)
@@ -275,6 +275,7 @@ def main():
 
     zermelo_cfg = load_config(args.zermelo_config)
     zermelo_cfg_src = tc.default_config_src_path(args.zermelo_config)
+    args.proj_wandb = args.proj_wandb or zermelo_cfg['wandb_project_name']
 
     # Wandb.
     exp_name = f'dt_sd{args.seed:03d}_{time.strftime("%Y%m%d_%H%M%S")}'

@@ -1,4 +1,9 @@
 # Zermelo navigation — single source of truth for env + dataset + training.
+#
+# ── Values for a new experiment ───
+dataset_save_path: datasets/1initialcondition_recreatingold.npz
+wandb_project_name: 1initialcondition_aw3_run
+#
 
 # --- Arena -----------------------------------------------------------------
 maze:
@@ -15,15 +20,13 @@ maze:
     - [1, 0, 0, 0, 1, 0, 0, 1]
     - [1, 1, 1, 1, 1, 1, 1, 1]
 
-# --- Sensors ----------------------------------------------------------------
-# Grid of evenly-spaced flow sensors added to the agent's observation.
-# null = disabled (default). Set to [N, M] for an N×M grid, e.g. [10, 10].
-# When enabled, 2*N*M extra values (vx, vy at each sensor) are appended to
-# the state vector after [x, y, flow_vx, flow_vy, goal_x, goal_y].
-# Sensors cover the full flow arena (flow.x_range × flow.y_range).
-# Changing this requires regenerating any existing dataset.
-sensors:
-  grid: null
+# --- Task ------------------------------------------------------------------
+task:
+  start_goal_mode: random         # 'random' | 'fixed'
+  fixed_start_ij: [6, 1]
+  fixed_goal_ij:  [1, 6]
+  noise_on_reset: true
+
 
 # --- Flow field (chained HIT snapshots) ------------------------------------
 # HIT1..HIT{train_max_file} form one continuous clip; each env step advances
@@ -41,7 +44,7 @@ flow:
   #   'random'               — i.i.d. uniform draw each episode
   #   <int> N                — exactly N evenly-spaced frames, cycled: episode i
   #                            uses frame i % N  (e.g. 10 for ten initial conditions)
-  start_frame_mode: 10
+  initial_flow_conditions: 1
 
 # --- Observation & dynamics ------------------------------------------------
 observation:
@@ -54,14 +57,20 @@ env:
   action_scale: 1.3               # action ∈ [-1,1]² → velocity = action_scale * action
   show_action_arrow: true
 
-# --- Task ------------------------------------------------------------------
-task:
-  start_goal_mode: random         # 'random' | 'fixed'
-  fixed_start_ij: [6, 1]
-  fixed_goal_ij:  [1, 6]
-  noise_on_reset: true
 
-# --- Reward ---------------------------------------------------------------
+# --- Sensors ----------------------------------------------------------------
+# Grid of evenly-spaced flow sensors added to the agent's observation.
+# null = disabled. Set to [N, M] for an N×M grid of sensors, e.g. [10, 10].
+# When enabled, 2*N*M extra values (vx, vy at each sensor) are appended to
+# the state vector after [x, y, flow_vx, flow_vy, goal_x, goal_y].
+# Sensors cover the full flow arena (flow.x_range × flow.y_range).
+# Changing this requires regenerating any existing dataset.
+sensors:
+  grid: null
+
+
+
+# --- Reward Weights ---------------------------------------------------------------
 # Per-step:
 #   reward = goal_reward * (reached this step)
 #          - (action_weight * ||action|| + fixed_hover_cost)
@@ -70,23 +79,30 @@ task:
 reward:
   goal_reward: 100.0
   energy:
-    action_weight: 0.7
-    fixed_hover_cost: 0.05
-  progress_weight: 1.5            # potential-based shaping (Ng et al. 1999)
+    action_weight: 0.08 #was 0.7
+    fixed_hover_cost: 0.13
+  progress_weight: 0.009            # potential-based shaping (Ng et al. 1999)
   drift_threshold: 0.0            # logging-only
+  # --- Old reward equivalents (run zermelo_hit_dynamic_poordataset / meanflowql) ---
+  # The old reward used: -distance_weight*dist - energy_weight*||a|| - time_weight
+  # To approximate that behaviour, set:
+  #   energy.action_weight:  0.08   (was energy_weight)
+  #   energy.fixed_hover_cost: 0.13 (was time_weight)
+  #   progress_weight: 0.009        (was distance_weight; note: old used absolute dist
+  #                                  penalty, new uses delta — magnitudes match for
+  #                                  smooth trajectories but shaping is different)
 
 # --- Dataset generation ---------------------------------------------------
 run:
   seed: 0
   num_episodes: 20000
   max_episode_steps: 1000
-  save_path: datasets/10initialconditions_straightpath.npz
 
 # Diversity controls — only used by generate_dataset.py (the diverse
 # generator). The straight-line oracle ignores this block entirely.
 dataset_diverse:
   route:
-    waypoints: [1, 4]             # [min, max] number of random intermediates
+    waypoints: [2, 4]             # [min, max] number of random intermediates
     detour_budget: 4              # max (route / direct-distance) ratio
     waypoint_tolerance: 2.0
     waypoint_step_budget: 0.4     # fraction of max_episode_steps per waypoint

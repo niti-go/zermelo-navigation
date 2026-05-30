@@ -63,7 +63,7 @@ FLAGS = flags.FLAGS
 flags.DEFINE_string('run_group', 'meanflowql', 'Run group in wandb')
 flags.DEFINE_integer('seed', 0, 'Random seed.')
 flags.DEFINE_string('env_name', 'zermelo-pointmaze-medium-v0', 'Environment name.')
-flags.DEFINE_string('proj_wandb', 'zermelo', 'wandb project name')
+flags.DEFINE_string('proj_wandb', None, 'wandb project name (default: wandb_project_name from zermelo_config.yaml)')
 flags.DEFINE_string('wandb_entity', 'RL_Control_JX',
                     'wandb entity (team/org). Set to None for personal account.')
 flags.DEFINE_string('save_dir', 'exp/', 'Save directory.')
@@ -150,12 +150,13 @@ def load_zermelo_dataset_for_mfql(dataset_path, reward_shift=0.0):
 def main(_):
     zermelo_cfg = load_config(FLAGS.zermelo_config)
     zermelo_cfg_src = tc.default_config_src_path(FLAGS.zermelo_config)
+    proj_wandb = FLAGS.proj_wandb or zermelo_cfg['wandb_project_name']
 
     # Wandb.
     exp_name = get_exp_name(FLAGS.seed)
     os.environ["WANDB_MODE"] = "online" if FLAGS.wandb_online else "offline"
     entity = FLAGS.wandb_entity if FLAGS.wandb_entity != 'None' else None
-    setup_wandb(project=FLAGS.proj_wandb, group=FLAGS.run_group, name=exp_name,
+    setup_wandb(project=proj_wandb, group=FLAGS.run_group, name=exp_name,
                 entity=entity, mode=os.environ["WANDB_MODE"],
                 wandb_output_dir=FLAGS.wandb_save_dir)
     wandb.config.update({'zermelo_config_yaml': zermelo_cfg}, allow_val_change=True)

@@ -242,7 +242,7 @@ def main(_):
 
     dc.print_stats(stats_list, reward_cfg,
                    header='Dataset stats (straight-line oracle)')
-    dc.save_dataset(dataset, run_cfg['save_path'])
+    dc.save_dataset(dataset, cfg['dataset_save_path'])
 
 
 if __name__ == '__main__':

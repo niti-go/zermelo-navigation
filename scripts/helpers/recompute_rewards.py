@@ -12,13 +12,13 @@ step, including the goal step.
 
 Usage:
     cd ~/zermelo-navigation
-    PYTHONPATH=. python scripts/helpers/recompute_rewards.py \
-        --action_weight=0.015 \
-        --fixed_hover_cost=0.088 \
-        --progress_weight=0.5
+    python scripts/helpers/recompute_rewards.py \
+        --action_weight=3.0 \
+        --fixed_hover_cost=0.05 \
+        --progress_weight=1.5
 
     # Or read all weights from the config file:
-    PYTHONPATH=. python scripts/helpers/recompute_rewards.py --from_config
+    python scripts/helpers/recompute_rewards.py --from_config
 """
 import os
 import sys

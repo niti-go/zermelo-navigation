@@ -138,8 +138,8 @@ def make_eval_env(zermelo_config_path=None, env_id='zermelo-pointmaze-medium-v0'
 
 
 def default_dataset_path(zermelo_cfg):
-    """Resolve `cfg['run']['save_path']` against the repo root."""
-    return os.path.join(REPO_ROOT, zermelo_cfg['run']['save_path'])
+    """Resolve `cfg['dataset_save_path']` against the repo root."""
+    return os.path.join(REPO_ROOT, zermelo_cfg['dataset_save_path'])
 
 
 def default_config_src_path(user_path):
