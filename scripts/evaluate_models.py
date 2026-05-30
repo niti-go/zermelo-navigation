@@ -137,7 +137,10 @@ from zermelo_env.hit_chain import HITChainFlow
 RESULTS_ROOT = os.path.join(_REPO_ROOT, 'results')
 
 # Visual constants (changing these only affects plots, not eval).
-ALGO_ORDER  = ('BC', 'DT', 'MeanFlowQL')
+# ZERMELO_EVAL_ALGOS env var (comma-separated) restricts which algos are run —
+# used by launch_experiment.sh to skip algos whose training crashed.
+_algos_env = os.environ.get('ZERMELO_EVAL_ALGOS', '')
+ALGO_ORDER  = tuple(_algos_env.split(',')) if _algos_env else ('BC', 'DT', 'MeanFlowQL')
 ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c'}
 
 
@@ -516,12 +519,44 @@ def n_train_frames(cfg, env):
     return int(n_total * train_max / max(n_files, 1))
 
 
+def _train_start_frames_like_dataset(mode, n_episodes, upper):
+    """Train-segment start frames mirroring the offline dataset generator.
+
+    Replicates helpers.dataset_common.sample_start_frame's schedule on
+    [0, upper] so the train segment is evaluated on the exact flow initial
+    conditions the policies trained on. `mode` is the config's
+    flow.initial_flow_conditions; `upper` is the largest start that keeps a
+    full episode inside the train segment (n_train - max_steps*fps).
+
+    With initial_flow_conditions: 1, every episode starts at frame 0.0 — the
+    first frame — matching a single-initial-condition dataset.
+    """
+    if upper <= 0.0:
+        return np.zeros(n_episodes, dtype=np.float64)
+    if isinstance(mode, int):
+        n = max(1, mode)
+        if n == 1:
+            return np.zeros(n_episodes, dtype=np.float64)
+        fixed = np.linspace(0.0, upper, n)
+        return np.array([fixed[i % n] for i in range(n_episodes)], dtype=np.float64)
+    if mode == 'deterministic_spread':
+        if n_episodes <= 1:
+            return np.zeros(n_episodes, dtype=np.float64)
+        return np.linspace(0.0, upper, n_episodes)
+    if mode == 'random':
+        rng = np.random.default_rng(SEED + hash('train') % (2**31))
+        return rng.uniform(0.0, upper, size=n_episodes)
+    raise ValueError(f'Unknown flow.initial_flow_conditions={mode!r}')
+
+
 def episode_start_frames(segment, n_episodes, cfg, env):
     """Return (start_frames[n_episodes], wraps_into_train) for `segment`.
 
-    Spread across the segment per START_FRAME_MODE. If the segment is shorter
-    than one max-length episode, episodes may wrap modulo n_frames (back into
-    the training segment); the second return flags that case.
+    train   — mirrors the offline dataset's flow.initial_flow_conditions exactly
+              (see _train_start_frames_like_dataset).
+    heldout — spread across the held-out segment per START_FRAME_MODE. If the
+              segment is shorter than one max-length episode, starts pin to the
+              segment boundary; the second return flags that case.
     """
     fps = float(env.unwrapped.frames_per_step)
     max_steps = int(cfg['run']['max_episode_steps'])
@@ -530,12 +565,19 @@ def episode_start_frames(segment, n_episodes, cfg, env):
     n_train = n_train_frames(cfg, env)
 
     if segment == 'train':
-        lo, hi_full = 0.0, float(n_train)
-    elif segment == 'heldout':
-        lo, hi_full = float(n_train), float(n_total)
-    else:
+        mode = cfg['flow'].get('initial_flow_conditions', START_FRAME_MODE)
+        upper = max(0.0, float(n_train) - span)
+        starts = _train_start_frames_like_dataset(mode, n_episodes, upper)
+        wraps = upper <= 0.0
+        if wraps:
+            print('  ⚠ [train] segment shorter than one episode — '
+                  'all start frames pinned to frame 0.')
+        return starts.astype(np.float64), wraps
+
+    if segment != 'heldout':
         raise ValueError(f'Unknown segment: {segment!r}')
 
+    lo, hi_full = float(n_train), float(n_total)
     hi_safe = max(lo, hi_full - span)
     can_avoid_wrap = hi_safe > lo
     # When the segment is shorter than one episode, the only safe start is lo
@@ -544,13 +586,10 @@ def episode_start_frames(segment, n_episodes, cfg, env):
     hi = hi_safe if can_avoid_wrap else lo
     wraps = not can_avoid_wrap
     if wraps:
-        print(f'  ⚠ [{segment}] segment shorter than one episode — '
+        print(f'  ⚠ [heldout] segment shorter than one episode — '
               f'all start frames pinned to frame {lo:.0f}')
 
-    # For the train segment, honour the dataset's initial_flow_conditions so eval
-    # lands on the same initial conditions the policies were trained on.
-    mode = START_FRAME_MODE if segment == 'heldout' else cfg['flow'].get('initial_flow_conditions', START_FRAME_MODE)
-
+    mode = START_FRAME_MODE
     if mode == 'random':
         rng = np.random.default_rng(SEED + hash(segment) % (2**31))
         starts = rng.uniform(lo, hi, size=n_episodes)
@@ -559,10 +598,6 @@ def episode_start_frames(segment, n_episodes, cfg, env):
             starts = np.full(n_episodes, lo, dtype=np.float64)
         else:
             starts = np.linspace(lo, hi, n_episodes)
-    elif isinstance(mode, int):
-        n = max(1, mode)
-        fixed = np.linspace(lo, min(hi, hi_safe) if can_avoid_wrap else hi, n) if n > 1 else np.array([lo])
-        starts = np.array([fixed[i % n] for i in range(n_episodes)], dtype=np.float64)
     else:
         raise ValueError(f'Unknown START_FRAME_MODE: {mode!r}')
 
@@ -602,22 +637,47 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
     goal_xy = np.asarray(env.unwrapped.cur_goal_xy, dtype=np.float64)
     init_dist = float(np.linalg.norm(np.asarray(obs[:2]) - goal_xy))
 
+    # Reward weights straight from the env, so the decomposition matches the
+    # reward the policy actually receives (no reliance on a separate config).
+    u = env.unwrapped
+    w_goal   = float(u._goal_reward)
+    w_action = float(u._action_weight)
+    w_hover  = float(u._fixed_hover_cost)
+    shift    = -1.0 if getattr(u, '_reward_task_id', None) is not None else 0.0
+
     done = False
     ep_ret = 0.0
     action_effort = 0.0
     traj, frames, step_rewards = [], [], []
+    # Per-step reward decomposition (lists, one entry per step).
+    comp = {'goal': [], 'action_energy': [], 'hover': [], 'progress': []}
     info = {}
     while not done:
         traj.append([float(obs[0]), float(obs[1])])
         if record_video:
             frames.append(env.render())
         action = policy.act(obs)
-        action_effort += float(np.linalg.norm(action))
+        amag = float(np.linalg.norm(action))
+        action_effort += amag
         obs, reward, terminated, truncated, info = env.step(action)
         policy.observe_reward(reward)
         step_rewards.append(float(reward))
         done = terminated or truncated
         ep_ret += reward
+
+        # Decompose this step's reward. The env pays:
+        #   reward = goal + (action_energy + hover) + progress + shift
+        # where info['energy_cost'] == action_energy + hover. Solve for progress
+        # so the four components sum back to `reward` exactly.
+        goal_c   = w_goal if info.get('success', 0.0) > 0.5 else 0.0
+        action_c = -w_action * amag
+        hover_c  = -w_hover
+        energy   = float(info.get('energy_cost', action_c + hover_c))
+        progress_c = float(reward) - shift - goal_c - energy
+        comp['goal'].append(goal_c)
+        comp['action_energy'].append(action_c)
+        comp['hover'].append(hover_c)
+        comp['progress'].append(progress_c)
 
     return {
         'return':        float(ep_ret),
@@ -628,6 +688,7 @@ def run_episode(env, policy, start_frame, init_ij, goal_ij, record_video):
         'final_dist':    float(info.get('dist_to_goal', float('nan'))),
         'trajectory':    traj,
         'step_rewards':  step_rewards,
+        'step_components': comp,
         'frames':        frames,
     }
 
@@ -684,6 +745,51 @@ def _offline_sample_step_rewards(cfg, n_episodes=2, seed=42):
     rng = np.random.default_rng(seed)
     idxs = rng.choice(len(ends), size=n_episodes, replace=False)
     return [rewards[int(starts[i]):int(ends[i]) + 1].tolist() for i in idxs]
+
+
+def _offline_sample_components(cfg, seed=42):
+    """One random offline episode decomposed into the same reward-component
+    format run_episode produces (goal / action_energy / hover / progress).
+
+    The dataset stores goal/energy/progress components and per-step actions, so
+    we split the combined energy into action-energy and fixed-hover to match the
+    policy decomposition. Prefers a successful episode so the goal term appears.
+    Returns a dict with step_components/return/success/length, or None.
+    """
+    p = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
+    if not os.path.exists(p):
+        return None
+    data = np.load(p)
+    rewards = data['rewards'].astype(np.float64)
+    terminals = data['terminals'].astype(np.float32)
+    ends = np.where(terminals > 0.5)[0]
+    if len(ends) == 0:
+        return None
+    starts = np.concatenate([[0], ends[:-1] + 1])
+
+    goal_tol = float(cfg['env']['goal_tolerance'])
+    success_mask = data['dist_to_goal'][ends] <= goal_tol
+    rng = np.random.default_rng(seed)
+    succ_idx = np.flatnonzero(success_mask)
+    i = int(rng.choice(succ_idx)) if len(succ_idx) else int(rng.integers(len(ends)))
+    s, e = int(starts[i]), int(ends[i])
+    sl = slice(s, e + 1)
+
+    action_weight = float(cfg['reward']['energy']['action_weight'])
+    hover_cost    = float(cfg['reward']['energy']['fixed_hover_cost'])
+    amag = np.linalg.norm(data['actions'][sl].astype(np.float64), axis=1)
+    comp = {
+        'goal':          data['goal_reward_components'][sl].astype(np.float64).tolist(),
+        'action_energy': (-action_weight * amag).tolist(),
+        'hover':         [-hover_cost] * (e - s + 1),
+        'progress':      data['progress_reward_components'][sl].astype(np.float64).tolist(),
+    }
+    return {
+        'step_components': comp,
+        'return':  float(rewards[sl].sum()),
+        'success': float(success_mask[i]),
+        'length':  e - s + 1,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -946,6 +1052,13 @@ def plot_reward_trajectories(by_segment, cfg, out_path, seed=42):
     results = by_segment[segment]
     rng = np.random.default_rng(seed)
 
+    # A goal-reaching step pays ~+goal_reward, dwarfing the ~-0.15 per-step
+    # rewards. Left to autoscale, that one terminal spike flattens every other
+    # step onto y=0. We detect spike steps and zoom the instantaneous axes to
+    # the per-step rewards, marking the goal spike separately.
+    goal_reward  = float(cfg['reward']['goal_reward'])
+    spike_thresh = goal_reward * 0.5
+
     offline_eps = _offline_sample_step_rewards(cfg, n_episodes=2, seed=seed)
 
     # Build (label, color, [step_rewards_ep0, step_rewards_ep1]) tuples.
@@ -980,17 +1093,151 @@ def plot_reward_trajectories(by_segment, cfg, out_path, seed=42):
             ax_c = axes[i, ep_idx * 2 + 1]
             ax_i.plot(steps, sr, color=color, linewidth=1.0)
             ax_i.axhline(0, color='black', linewidth=0.5, linestyle='--', alpha=0.4)
+            # Zoom the axis to the non-spike rewards so the per-step signal is
+            # visible; mark goal-reward spikes with a red ▲ + value above the top.
+            spike = sr > spike_thresh
+            base = sr[~spike]
+            if spike.any() and base.size:
+                lo, hi = float(base.min()), float(base.max())
+                pad = max(0.02, 0.1 * (hi - lo))
+                ax_i.set_ylim(lo - pad, hi + pad)
+                for gs in np.flatnonzero(spike):
+                    ax_i.scatter([steps[gs]], [hi + pad], marker='^',
+                                 color='#d62728', s=24, clip_on=False, zorder=5)
+                    ax_i.annotate(f'goal +{sr[gs]:.0f}', xy=(steps[gs], hi + pad),
+                                  xytext=(0, 3), textcoords='offset points',
+                                  ha='center', va='bottom', fontsize=7,
+                                  color='#d62728')
             ax_i.set_xlabel('Step', fontsize=8)
             ax_i.grid(True, alpha=0.3)
             ax_c.plot(steps, cumul, color=color, linewidth=1.2)
             ax_c.set_xlabel('Step', fontsize=8)
             ax_c.grid(True, alpha=0.3)
 
-    fig.suptitle(f'Per-step reward trajectories — policy episodes from {SEGMENT_LABEL[segment]}',
-                 fontsize=12)
+    fig.suptitle(f'Per-step reward trajectories — policy episodes from {SEGMENT_LABEL[segment]}\n'
+                 f'(instantaneous axes zoom to per-step rewards; goal-reward spikes marked ▲)',
+                 fontsize=11)
     fig.tight_layout()
     fig.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+
+# Per reward-component plotting constants (shared with the standalone generator).
+_REWARD_COMPONENTS = [
+    ('progress',      'Progress',      '#2ca02c'),
+    ('action_energy', 'Energy (action)', '#1f77b4'),
+    ('hover',         'Fixed hover',   '#ff7f0e'),
+    ('goal',          'Goal',          '#d62728'),
+]
+
+
+def _pick_episode_for_components(eps, prefer_success=True):
+    """Choose one representative episode index: first success if available
+    (so the goal component is visible), else the highest-return episode."""
+    if not eps:
+        return None
+    if prefer_success:
+        for i, e in enumerate(eps):
+            if e.get('success', 0.0) > 0.5 and e.get('step_components'):
+                return i
+    with_comp = [i for i, e in enumerate(eps) if e.get('step_components')]
+    if not with_comp:
+        return None
+    return max(with_comp, key=lambda i: eps[i]['return'])
+
+
+def plot_reward_component_breakdown(by_segment, out_path, segment=None,
+                                    cfg=None, seed=42):
+    """One row per source; columns = [instantaneous, cumulative]. Each panel
+    overlays the per-step reward *components* (progress, action-energy, fixed
+    hover, goal) for a single representative episode, so you can see exactly
+    where each source's reward comes from and how it accumulates.
+
+    When `cfg` is given, a random offline-dataset episode is added as the top
+    row for reference. The instantaneous goal spike (+goal_reward on the goal
+    step) is drawn as a marker on a zoomed axis so it doesn't crush the small
+    per-step components; the cumulative panel shows the full goal step plus a
+    dashed total line.
+    """
+    if segment is None:
+        segment = 'heldout' if 'heldout' in by_segment else list(by_segment.keys())[0]
+    results = by_segment[segment]
+
+    rows = []
+    if cfg is not None:
+        off = _offline_sample_components(cfg, seed=seed)
+        if off is not None:
+            rows.append(('Offline dataset\n(train flow)', off))
+    for algo in ALGO_ORDER:
+        eps = results.get(algo, [])
+        idx = _pick_episode_for_components(eps)
+        if idx is not None:
+            rows.append((algo, eps[idx]))
+    if not rows:
+        print('  [reward components] no episodes with component data; skipping plot.')
+        return
+
+    fig, axes = plt.subplots(len(rows), 2,
+                             figsize=(13, len(rows) * 2.9), squeeze=False)
+    axes[0, 0].set_title('Instantaneous reward by component', fontsize=10, fontweight='bold')
+    axes[0, 1].set_title('Cumulative reward by component', fontsize=10, fontweight='bold')
+
+    for i, (algo, ep) in enumerate(rows):
+        comp = ep['step_components']
+        n = len(comp['goal'])
+        steps = np.arange(n)
+        ax_i, ax_c = axes[i, 0], axes[i, 1]
+
+        small_lo, small_hi = 0.0, 0.0
+        total_cumul = np.zeros(n)
+        for key, label, color in _REWARD_COMPONENTS:
+            vals = np.asarray(comp[key], dtype=np.float64)
+            cumul = np.cumsum(vals)
+            total_cumul += cumul  # sum of cumulative components = cumulative total
+            ax_c.plot(steps, cumul, color=color, linewidth=1.3, label=label)
+            if key == 'goal':
+                # Spiky: the goal step is +goal_reward, far above the per-step
+                # components. Register a legend handle here; the actual markers
+                # are drawn at the top of the zoomed axis after the loop.
+                ax_i.scatter([], [], marker='^', color=color, s=26, label=label)
+            else:
+                ax_i.plot(steps, vals, color=color, linewidth=1.0, label=label)
+                small_lo = min(small_lo, float(vals.min()))
+                small_hi = max(small_hi, float(vals.max()))
+
+        # Zoom the instantaneous axis to the small (non-goal) components; place
+        # the goal markers at the top edge with their value annotated.
+        pad = max(0.01, 0.12 * (small_hi - small_lo))
+        ax_i.set_ylim(small_lo - pad, small_hi + pad)
+        gsteps = np.flatnonzero(np.asarray(comp['goal']) > 0.5)
+        for gs in gsteps:
+            gval = comp['goal'][gs]
+            ax_i.scatter([gs], [small_hi + pad], marker='^', color='#d62728',
+                         s=26, clip_on=False, zorder=6)
+            ax_i.annotate(f'goal +{gval:.0f}', xy=(gs, small_hi + pad),
+                          xytext=(0, 3), textcoords='offset points',
+                          ha='center', va='bottom', fontsize=7, color='#d62728')
+
+        ax_c.plot(steps, total_cumul, color='black', linewidth=1.2,
+                  linestyle='--', alpha=0.7, label='Total')
+        ax_i.axhline(0, color='black', linewidth=0.5, linestyle=':', alpha=0.4)
+        ax_c.axhline(0, color='black', linewidth=0.5, linestyle=':', alpha=0.4)
+        for ax in (ax_i, ax_c):
+            ax.grid(True, alpha=0.3)
+            ax.set_xlabel('Step', fontsize=8)
+        tag = 'success' if ep.get('success', 0.0) > 0.5 else 'fail'
+        ax_i.set_ylabel(f'{algo}\n(ep: {tag}, return={ep["return"]:.1f})', fontsize=9)
+        if i == 0:
+            ax_i.legend(fontsize=7, loc='lower left', ncol=2)
+            ax_c.legend(fontsize=7, loc='lower left', ncol=2)
+
+    seg_label = SEGMENT_LABEL.get(segment, segment)
+    fig.suptitle(f'Reward component breakdown — one episode per algorithm from {seg_label}\n'
+                 f'(instantaneous goal spikes marked ▲ on a zoomed axis)', fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  wrote reward-component breakdown → {out_path}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1049,6 +1296,14 @@ def main():
     t0 = time.time()
     _maybe_drop_legacy_results()
 
+    # ── Config ──────────────────────────────────────────────────────────────
+    global EXP_PROJECT, SEGMENT_LABEL
+    cfg = load_config(None)
+    EXP_PROJECT = cfg['wandb_project_name']
+    SEGMENT_LABEL = _make_segment_labels(cfg)
+    device = torch.device(DEVICE)
+    dataset_path = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
+
     # ── Output dir ──────────────────────────────────────────────────────────
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     out_dir = os.path.join(RESULTS_ROOT, EXP_PROJECT, timestamp)
@@ -1066,14 +1321,6 @@ def main():
     for a in ALGO_ORDER:
         print(f'  {a:12s}  run_dir={os.path.relpath(run_dirs[a], _REPO_ROOT)}')
         print(f'  {"":12s}  ckpt   ={os.path.relpath(ckpts[a],    _REPO_ROOT)}')
-
-    # ── Config + env ────────────────────────────────────────────────────────
-    cfg = load_config(None)
-    global EXP_PROJECT, SEGMENT_LABEL
-    EXP_PROJECT = cfg['wandb_project_name']
-    SEGMENT_LABEL = _make_segment_labels(cfg)
-    device = torch.device(DEVICE)
-    dataset_path = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
 
     # ── Load policies ───────────────────────────────────────────────────────
     print('\nLoading policies…')
@@ -1169,6 +1416,8 @@ def main():
 
     plot_reward_trajectories(by_segment, cfg,
                              os.path.join(plots_dir, 'reward_trajectories.png'))
+    plot_reward_component_breakdown(
+        by_segment, os.path.join(plots_dir, 'reward_components.png'), cfg=cfg)
 
     # ── Persist metrics + manifest ──────────────────────────────────────────
     metrics_rows = []
@@ -1204,7 +1453,7 @@ def main():
     print(f'\nWrote {csv_path}')
 
     # Raw per-episode dicts (no frames or step_rewards) — for ad-hoc analysis.
-    _strip = {'frames', 'step_rewards'}
+    _strip = {'frames', 'step_rewards', 'step_components'}
     with open(os.path.join(out_dir, 'raw_episodes.json'), 'w') as f:
         json.dump({s: {a: [{k: v for k, v in ep.items() if k not in _strip}
                             for ep in results_for_a]
@@ -1220,7 +1469,8 @@ def main():
         'num_eval_episodes':   NUM_EVAL_EPISODES,
         'num_video_episodes':  NUM_VIDEO_EPISODES,
         'eval_flow_segments':  list(EVAL_FLOW_SEGMENTS),
-        'initial_flow_conditions':    START_FRAME_MODE,
+        'heldout_start_frame_mode':       START_FRAME_MODE,
+        'train_initial_flow_conditions':  cfg['flow'].get('initial_flow_conditions'),
         'checkpoint_policy':   CHECKPOINT_POLICY,
         'compare_to_offline_dataset': COMPARE_TO_OFFLINE_DATASET,
         'device':              DEVICE,

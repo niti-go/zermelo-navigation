@@ -1,9 +1,9 @@
 # Zermelo navigation — single source of truth for env + dataset + training.
 #
 # ── Values for a new experiment ───
-dataset_save_path: datasets/1initialcondition_recreatingold.npz
-wandb_project_name: 1initialcondition_aw3_run
-#
+dataset_save_path: datasets/1initialcondition_higherenergycosts.npz
+wandb_project_name: higherenergycosts
+dataset_type: diverse          # 'straight' | 'diverse'
 
 # --- Arena -----------------------------------------------------------------
 maze:
@@ -38,12 +38,13 @@ flow:
   frames_per_step: 5
   target_max: 2.3                 # rescale peak velocity (agent max ≈ 2.83)
   n_tiles: 1.0                    # native-box copies tiling the arena
-  train_max_file: 44
+  train_max_file: 30
   # How episode start frames are assigned within the train segment:
   #   'deterministic_spread' — one unique frame per episode, sweeping the full range
   #   'random'               — i.i.d. uniform draw each episode
   #   <int> N                — exactly N evenly-spaced frames, cycled: episode i
   #                            uses frame i % N  (e.g. 10 for ten initial conditions)
+  # The last flow file is number 49
   initial_flow_conditions: 1
 
 # --- Observation & dynamics ------------------------------------------------
@@ -68,8 +69,6 @@ env:
 sensors:
   grid: null
 
-
-
 # --- Reward Weights ---------------------------------------------------------------
 # Per-step:
 #   reward = goal_reward * (reached this step)
@@ -79,8 +78,8 @@ sensors:
 reward:
   goal_reward: 100.0
   energy:
-    action_weight: 0.08 #was 0.7
-    fixed_hover_cost: 0.13
+    action_weight: 0.3 #was 0.7
+    fixed_hover_cost: 0.0125
   progress_weight: 0.009            # potential-based shaping (Ng et al. 1999)
   drift_threshold: 0.0            # logging-only
   # --- Old reward equivalents (run zermelo_hit_dynamic_poordataset / meanflowql) ---

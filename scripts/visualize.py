@@ -31,18 +31,16 @@ ENV_NAME = 'zermelo-pointmaze-medium-v0'
 
 
 def find_latest_dataset():
-    """Find the most recently modified .npz file under the project root."""
+    """Return dataset path from zermelo_config.yaml (dataset_save_path)."""
+    from zermelo_env.zermelo_config import load_config
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(script_dir)
-    candidates = glob.glob(os.path.join(project_root, '**', '*.npz'), recursive=True)
-    # Exclude val datasets.
-    candidates = [c for c in candidates if '-val.npz' not in c]
-    if not candidates:
-        print('No .npz dataset found. Run scripts/generate_dataset.py '
-              '(or generate_straight_dataset.py) first.')
+    cfg = load_config()
+    path = os.path.join(project_root, cfg['dataset_save_path'])
+    if not os.path.exists(path):
+        print(f'Dataset not found at {path}. Run scripts/generate_dataset.py first.')
         sys.exit(1)
-    latest = max(candidates, key=os.path.getmtime)
-    return latest
+    return path
 
 
 def find_episode_boundaries(terminals):
