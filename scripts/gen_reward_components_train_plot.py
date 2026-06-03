@@ -1,14 +1,13 @@
-"""Generate ONLY the reward-component breakdown plot, fast.
+"""Generate the reward-component breakdown plot for the TRAINING flow segment.
 
-Reuses evaluate_models.py's loaders to run one representative held-out episode
-per algorithm (BC / DT / MeanFlowQL) and writes plots/reward_components.png —
-without running the full 200-episode × 2-segment evaluation.
+Same approach as gen_reward_components_plot.py but uses train-segment start
+frames.  Writes plots/reward_components_train.png into the latest results dir.
 
 Usage
 -----
     conda activate flowrl
     cd ~/zermelo-navigation
-    python scripts/gen_reward_components_plot.py
+    python scripts/gen_reward_components_train_plot.py
 """
 import os
 import sys
@@ -20,10 +19,10 @@ import numpy as np
 
 import evaluate_models as ev  # triggers GPU pick + env imports
 
-# How many candidate held-out episodes to try per algo when hunting for a
+# How many candidate episodes to try per algo when hunting for a
 # success (so the goal component is visible). Falls back to best-return.
 MAX_TRIES = 40
-SEGMENT = 'heldout'
+SEGMENT = 'train'
 
 
 def main():
@@ -63,11 +62,11 @@ def main():
     if 'MeanFlowQL' in algos:
         policies['MeanFlowQL'] = ev.load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
 
-    # ── Held-out env + episode schedule ──────────────────────────────────────
+    # ── Train-segment env + episode schedule ─────────────────────────────────
     env = ev.make_env(cfg)
     n_total = int(env.unwrapped.n_frames)
     n_train = ev.n_train_frames(cfg, env)
-    print(f'Flow: total={n_total}, train={n_train}, held-out=[{n_train},{n_total})')
+    print(f'Flow: total={n_total}, train=[0,{n_train}), held-out=[{n_train},{n_total})')
 
     start_frames, _ = ev.episode_start_frames(SEGMENT, MAX_TRIES, cfg, env)
     cells = ev.free_cells(env)
@@ -95,9 +94,6 @@ def main():
     env.close()
 
     # ── Plot ─────────────────────────────────────────────────────────────────
-    # Write into the SAME plots/ folder evaluate_models.py uses: the latest
-    # results/<EXP_PROJECT>/<timestamp>/plots dir. If no run exists yet, make a
-    # fresh timestamped dir so the file still lands under the standard layout.
     import glob
     from datetime import datetime
     proj_root = os.path.join(ev.RESULTS_ROOT, ev.EXP_PROJECT)
@@ -107,7 +103,7 @@ def main():
         proj_root, datetime.now().strftime('%Y%m%d_%H%M%S'))
     plots_dir = os.path.join(run_dir, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
-    out_path = os.path.join(plots_dir, 'reward_components.png')
+    out_path = os.path.join(plots_dir, 'reward_components_train.png')
     ev.plot_reward_component_breakdown({SEGMENT: results}, out_path,
                                        segment=SEGMENT, cfg=cfg)
     print(f'\nDone. Plot: {out_path}')

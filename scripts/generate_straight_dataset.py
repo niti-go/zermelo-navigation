@@ -41,13 +41,17 @@ flags.DEFINE_integer('num_workers', 16,
                      'Number of parallel worker processes. 1 = run serially in-process.')
 
 
-def _straight_action(direction, flow_xy, action_scale):
+def _straight_action(direction, flow_xy, action_scale, speed_fraction=1.0):
     """Return the action that produces motion along `direction` (unit vector).
 
     Solves (action_scale * action + flow) = s * direction for the largest
     s ≥ 0 keeping action ∈ [-1, 1]^2. If no s ≥ 0 satisfies the box (flow
     drags us away too hard), return the clipped action at s=0 (best-effort
     against flow).
+
+    The full-speed action is then scaled by `speed_fraction` ∈ [0, 1].
+    At 0 the agent drifts passively with the flow (action = 0); at 1 it
+    moves at maximum speed toward the target.
     """
     fx, fy = float(flow_xy[0]), float(flow_xy[1])
     dx, dy = float(direction[0]), float(direction[1])
@@ -64,7 +68,8 @@ def _straight_action(direction, flow_xy, action_scale):
 
     s = max(0.0, s_max if np.isfinite(s_max) else 0.0)
     action = np.array([(s * dx - fx) / a, (s * dy - fy) / a])
-    return np.clip(action, -1.0, 1.0)
+    action = np.clip(action, -1.0, 1.0)
+    return action * speed_fraction
 
 
 def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
@@ -98,6 +103,13 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
 
     prev_dist = float(np.linalg.norm(env.unwrapped.get_xy() - goal_xy))
 
+    # Speed-fraction oscillation: each episode gets a random phase and
+    # period so the dataset covers the full range of action magnitudes
+    # (0 = pure drift, 1 = full speed) with good diversity across episodes.
+    max_steps = int(cfg['run']['max_episode_steps'])
+    n_cycles = np.random.uniform(1.5, 4.0)        # 1.5–4 full cycles per ep
+    phase = np.random.uniform(0, 2 * np.pi)       # random phase offset
+
     ep_data = dc.new_ep_data()
     done = False
     step = 0
@@ -106,6 +118,10 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
 
     info = {}
     while not done:
+        # Oscillate speed_fraction via a sinusoidal wave: [0, 1]
+        speed_fraction = 0.5 * (1.0 + np.sin(
+            2.0 * np.pi * n_cycles * step / max_steps + phase))
+
         agent_xy = env.unwrapped.get_xy()
 
         if maze_enabled:
@@ -123,7 +139,8 @@ def _run_one_episode(env, cfg, maze_map, all_cells, bfs_cache,
         # appends [flow_vx, flow_vy] when include_flow_in_obs). Reusing it
         # avoids a third per-step flow lookup beyond the two env.step does.
         flow_xy = (float(ob[2]), float(ob[3]))
-        action = _straight_action(direction, flow_xy, action_scale)
+        action = _straight_action(direction, flow_xy, action_scale,
+                                  speed_fraction=speed_fraction)
 
         next_ob, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated

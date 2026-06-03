@@ -105,9 +105,10 @@ class DecisionTransformer(nn.Module):
         stacked = self.embed_ln(stacked)
 
         seq_len = 3 * T
-        causal_mask = torch.triu(
-            torch.ones(seq_len, seq_len, device=stacked.device), diagonal=1).bool()
-        hidden = self.transformer(stacked, mask=causal_mask)
+        if not hasattr(self, '_causal_mask') or self._causal_mask.shape[0] != seq_len:
+            self._causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=stacked.device), diagonal=1).bool()
+        hidden = self.transformer(stacked, mask=self._causal_mask)
 
         # Extract state token positions (indices 1, 4, 7, ...).
         state_hidden = hidden[:, 1::3, :]
@@ -119,55 +120,66 @@ class DecisionTransformer(nn.Module):
 # ---------------------------------------------------------------------------
 
 class DTDataset:
-    """Samples random sub-sequences from episodes for DT training."""
+    """Samples random sub-sequences from episodes for DT training.
+
+    Pre-pads all episodes to context_len and concatenates into contiguous
+    arrays so sampling is a single vectorised gather (no Python for-loop).
+    """
 
     def __init__(self, episodes, context_len, obs_mean, obs_std,
                  max_ep_len=1024, rtg_scale=100.0, device='cpu'):
-        self.episodes = episodes
         self.context_len = context_len
         self.max_ep_len = max_ep_len
-        self.rtg_scale = rtg_scale
-        self.obs_mean = obs_mean
-        self.obs_std = obs_std
         self.device = device
-        lens = np.array([len(ep['observations']) for ep in episodes])
-        self.weights = lens / lens.sum()
+        K = context_len
+
+        obs_dim = episodes[0]['observations'].shape[1]
+        act_dim = episodes[0]['actions'].shape[1]
+
+        # Build a flat table of all valid (episode, start) windows.
+        # For each window we store a pre-normalised, zero-padded chunk.
+        all_states, all_actions, all_rtgs, all_timesteps, all_masks = [], [], [], [], []
+        for ep in episodes:
+            obs = (ep['observations'] - obs_mean) / obs_std
+            acts = ep['actions']
+            rtg = ep['rtg'] / rtg_scale
+            ep_len = len(obs)
+            n_windows = max(1, ep_len - K + 1)
+            for start in range(n_windows):
+                length = min(K, ep_len - start)
+                s = np.zeros((K, obs_dim), dtype=np.float32)
+                a = np.zeros((K, act_dim), dtype=np.float32)
+                r = np.zeros((K, 1), dtype=np.float32)
+                t = np.zeros(K, dtype=np.int64)
+                m = np.zeros(K, dtype=np.float32)
+                s[:length] = obs[start:start + length]
+                a[:length] = acts[start:start + length]
+                r[:length, 0] = rtg[start:start + length]
+                t[:length] = np.arange(start, start + length).clip(0, max_ep_len - 1)
+                m[:length] = 1.0
+                all_states.append(s)
+                all_actions.append(a)
+                all_rtgs.append(r)
+                all_timesteps.append(t)
+                all_masks.append(m)
+
+        self.states = np.stack(all_states)       # (N, K, obs_dim)
+        self.actions = np.stack(all_actions)      # (N, K, act_dim)
+        self.rtgs = np.stack(all_rtgs)            # (N, K, 1)
+        self.timesteps = np.stack(all_timesteps)  # (N, K)
+        self.masks = np.stack(all_masks)          # (N, K)
+        self.n_windows = len(all_states)
+        print(f"  DTDataset: {self.n_windows:,} windows pre-computed")
 
     def sample(self, batch_size):
-        obs_dim = self.episodes[0]['observations'].shape[1]
-        act_dim = self.episodes[0]['actions'].shape[1]
-        K = self.context_len
-
-        states = torch.zeros(batch_size, K, obs_dim, device=self.device)
-        actions = torch.zeros(batch_size, K, act_dim, device=self.device)
-        rtgs = torch.zeros(batch_size, K, 1, device=self.device)
-        timesteps = torch.zeros(batch_size, K, dtype=torch.long, device=self.device)
-        masks = torch.zeros(batch_size, K, device=self.device)
-
-        ep_indices = np.random.choice(len(self.episodes), size=batch_size, p=self.weights)
-        for i, ep_idx in enumerate(ep_indices):
-            ep = self.episodes[ep_idx]
-            ep_len = len(ep['observations'])
-
-            if ep_len <= K:
-                start, length = 0, ep_len
-            else:
-                start = np.random.randint(0, ep_len - K + 1)
-                length = K
-
-            obs_norm = (ep['observations'][start:start + length] - self.obs_mean) / self.obs_std
-
-            states[i, :length] = torch.tensor(obs_norm, device=self.device)
-            actions[i, :length] = torch.tensor(
-                ep['actions'][start:start + length], device=self.device)
-            rtgs[i, :length, 0] = torch.tensor(
-                ep['rtg'][start:start + length] / self.rtg_scale, device=self.device)
-            timesteps[i, :length] = torch.arange(start, start + length, device=self.device)
-            masks[i, :length] = 1.0
-
-        timesteps = timesteps.clamp(0, self.max_ep_len - 1)
-        return {'states': states, 'actions': actions, 'rtgs': rtgs,
-                'timesteps': timesteps, 'masks': masks}
+        idx = np.random.randint(0, self.n_windows, size=batch_size)
+        return {
+            'states': torch.as_tensor(self.states[idx], device=self.device),
+            'actions': torch.as_tensor(self.actions[idx], device=self.device),
+            'rtgs': torch.as_tensor(self.rtgs[idx], device=self.device),
+            'timesteps': torch.as_tensor(self.timesteps[idx], device=self.device),
+            'masks': torch.as_tensor(self.masks[idx], device=self.device),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -241,7 +253,7 @@ def main():
     parser = argparse.ArgumentParser(description='Decision Transformer on Zermelo')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--train_steps', type=int, default=500000)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--weight_decay', type=float, default=1e-4)
     parser.add_argument('--hidden_dim', type=int, default=128)
@@ -271,6 +283,8 @@ def main():
     torch.manual_seed(args.seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     print(f"Device: {device}")
 
     zermelo_cfg = load_config(args.zermelo_config)
@@ -331,22 +345,34 @@ def main():
 
     eval_env = tc.make_eval_env(args.zermelo_config)
 
+    # Compile model for faster execution (PyTorch 2.0+).
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model)
+        print("  torch.compile enabled")
+
+    # AMP (mixed precision) for faster matmuls.
+    scaler = torch.amp.GradScaler('cuda')
+    amp_dtype = torch.float16
+
     # Training.
     first_time = time.time()
     last_time = time.time()
     for step in tqdm(range(1, args.train_steps + 1), desc="DT Training", dynamic_ncols=True):
         batch = train_ds.sample(args.batch_size)
-        action_preds = model(batch['rtgs'], batch['states'], batch['actions'], batch['timesteps'])
-        mask = batch['masks'].unsqueeze(-1)
-        loss = (((action_preds - batch['actions']) ** 2) * mask).sum() / mask.sum() / act_dim
+        with torch.amp.autocast('cuda', dtype=amp_dtype):
+            action_preds = model(batch['rtgs'], batch['states'], batch['actions'], batch['timesteps'])
+            mask = batch['masks'].unsqueeze(-1)
+            loss = (((action_preds - batch['actions']) ** 2) * mask).sum() / mask.sum() / act_dim
 
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.25)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         if step % args.log_interval == 0:
-            with torch.no_grad():
+            with torch.no_grad(), torch.amp.autocast('cuda', dtype=amp_dtype):
                 val_batch = val_ds.sample(args.batch_size)
                 val_preds = model(val_batch['rtgs'], val_batch['states'],
                                   val_batch['actions'], val_batch['timesteps'])
@@ -374,7 +400,10 @@ def main():
                   f"length={eval_info['episode.length']:.0f}")
 
         if step % args.save_interval == 0:
-            torch.save(model.state_dict(), os.path.join(save_dir, f'model_{step}.pt'))
+            # Strip '_orig_mod.' prefix added by torch.compile so checkpoints
+            # load cleanly into an uncompiled model.
+            sd = {k.removeprefix('_orig_mod.'): v for k, v in model.state_dict().items()}
+            torch.save(sd, os.path.join(save_dir, f'model_{step}.pt'))
 
     wandb.finish()
     print("Done.")

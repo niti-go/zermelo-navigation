@@ -412,7 +412,10 @@ def load_dt(run_dir, ckpt_path, device, dataset_path):
         n_layers=flags['n_layers'], context_len=flags['context_len'],
         max_ep_len=flags['max_ep_len'], dropout=flags['dropout'],
     ).to(device)
-    net.load_state_dict(torch.load(ckpt_path, map_location=device))
+    sd = torch.load(ckpt_path, map_location=device)
+    # torch.compile saves keys with an '_orig_mod.' prefix — strip it.
+    sd = {k.removeprefix('_orig_mod.'): v for k, v in sd.items()}
+    net.load_state_dict(sd)
     net.eval()
     # target_return: max episode return in the offline dataset.
     target_return = _dataset_max_return(dataset_path)
@@ -1297,7 +1300,7 @@ def main():
     _maybe_drop_legacy_results()
 
     # ── Config ──────────────────────────────────────────────────────────────
-    global EXP_PROJECT, SEGMENT_LABEL
+    global EXP_PROJECT, SEGMENT_LABEL, ALGO_ORDER
     cfg = load_config(None)
     EXP_PROJECT = cfg['wandb_project_name']
     SEGMENT_LABEL = _make_segment_labels(cfg)
@@ -1315,19 +1318,34 @@ def main():
 
     # ── Resolve checkpoints ─────────────────────────────────────────────────
     print('\nResolving checkpoints…')
-    run_dirs = {a: find_run_dir(a) for a in ALGO_ORDER}
-    ckpts    = {a: select_checkpoint(run_dirs[a], a, CHECKPOINT_POLICY[a])
-                for a in ALGO_ORDER}
+    run_dirs = {}
+    ckpts = {}
+    skipped = []
     for a in ALGO_ORDER:
-        print(f'  {a:12s}  run_dir={os.path.relpath(run_dirs[a], _REPO_ROOT)}')
-        print(f'  {"":12s}  ckpt   ={os.path.relpath(ckpts[a],    _REPO_ROOT)}')
+        try:
+            run_dirs[a] = find_run_dir(a)
+            ckpts[a] = select_checkpoint(run_dirs[a], a, CHECKPOINT_POLICY[a])
+            print(f'  {a:12s}  run_dir={os.path.relpath(run_dirs[a], _REPO_ROOT)}')
+            print(f'  {"":12s}  ckpt   ={os.path.relpath(ckpts[a],    _REPO_ROOT)}')
+        except FileNotFoundError as e:
+            print(f'  {a:12s}  SKIPPED — {e}')
+            skipped.append(a)
+    ALGO_ORDER = tuple(a for a in ALGO_ORDER if a not in skipped)
+    if not ALGO_ORDER:
+        raise RuntimeError('No algorithms have checkpoints — nothing to evaluate.')
+    if skipped:
+        print(f'\n  ⚠ Proceeding with: {", ".join(ALGO_ORDER)}')
 
     # ── Load policies ───────────────────────────────────────────────────────
     print('\nLoading policies…')
-    bc_pi   = load_bc(run_dirs['BC'], ckpts['BC'], device)
-    dt_pi, dt_target = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
-    mfql_pi = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
-    policies = {'BC': bc_pi, 'DT': dt_pi, 'MeanFlowQL': mfql_pi}
+    policies = {}
+    dt_target = None
+    if 'BC' in ALGO_ORDER:
+        policies['BC'] = load_bc(run_dirs['BC'], ckpts['BC'], device)
+    if 'DT' in ALGO_ORDER:
+        policies['DT'], dt_target = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
+    if 'MeanFlowQL' in ALGO_ORDER:
+        policies['MeanFlowQL'] = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
 
     # ── Envs ────────────────────────────────────────────────────────────────
     render_env   = make_env(cfg, render_mode='rgb_array') if NUM_VIDEO_EPISODES > 0 else None
@@ -1489,11 +1507,12 @@ def main():
     with open(os.path.join(out_dir, 'manifest.json'), 'w') as f:
         json.dump(manifest, f, indent=2)
 
-    # Snapshot the zermelo_config that the policies were *trained* under
-    # (taken from the BC run dir — all three are trained against the same yaml).
-    train_cfg_src = os.path.join(run_dirs['BC'], 'zermelo_config.json')
-    if os.path.isfile(train_cfg_src):
-        shutil.copy2(train_cfg_src, os.path.join(out_dir, 'zermelo_config.json'))
+    # Snapshot the zermelo_config that the policies were *trained* under.
+    for a in ALGO_ORDER:
+        train_cfg_src = os.path.join(run_dirs[a], 'zermelo_config.json')
+        if os.path.isfile(train_cfg_src):
+            shutil.copy2(train_cfg_src, os.path.join(out_dir, 'zermelo_config.json'))
+            break
 
     # ── Cleanup + final summary ─────────────────────────────────────────────
     if render_env is not None:   render_env.close()
