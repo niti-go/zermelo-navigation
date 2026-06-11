@@ -156,7 +156,7 @@ def main(_):
     proj_wandb = FLAGS.proj_wandb or zermelo_cfg['wandb_project_name']
 
     # Wandb.
-    exp_name = get_exp_name(FLAGS.seed)
+    exp_name = f'mfbc_{get_exp_name(FLAGS.seed)}'
     os.environ["WANDB_MODE"] = "online" if FLAGS.wandb_online else "offline"
     entity = FLAGS.wandb_entity if FLAGS.wandb_entity != 'None' else None
     setup_wandb(project=proj_wandb, group=FLAGS.run_group, name=exp_name,
@@ -396,7 +396,7 @@ def main(_):
                 'early_stopping/step': i,
                 'early_stopping/metric': FLAGS.early_stopping_metric,
                 'early_stopping/best_metric_value': best_metric_value,
-            })
+            }, step=i)
             break
 
     wandb.finish()
