@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Launch BC, DT, and MeanFlowQL training runs in parallel detached tmux
-# sessions, each pinned to a different GPU.
+# Launch BC, DT, MeanFlowQL, and MeanFlowBC (critic-free) training runs in
+# parallel detached tmux sessions, each pinned to a different GPU.
 #
 # Picks the N least-loaded GPUs (sorted by memory.used ascending) from
 # `nvidia-smi`. Kills any existing tmux sessions with the same names before
@@ -16,6 +16,7 @@
 #   BC_STEPS    — BC train_steps                        (default 500000)
 #   DT_STEPS    — DT train_steps                        (default 500000)
 #   MFQL_STEPS  — MeanFlowQL offline_steps              (default 1000000)
+#   MFBC_STEPS  — MeanFlowBC (critic-free) offline_steps (default 1000000)
 #   PROJ_WANDB  — wandb project                         (default: wandb_project_name from zermelo_config.yaml)
 #
 # Wandb entity is always RL_Control_JX (not configurable here).
@@ -30,6 +31,7 @@ SEED="${SEED:-0}"
 BC_STEPS="${BC_STEPS:-500000}"
 DT_STEPS="${DT_STEPS:-500000}"
 MFQL_STEPS="${MFQL_STEPS:-1000000}"
+MFBC_STEPS="${MFBC_STEPS:-1000000}"
 PROJ_WANDB="${PROJ_WANDB:-$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO_ROOT/zermelo_config.yaml'))['wandb_project_name'])")}"
 WANDB_ENTITY="RL_Control_JX"
 CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -61,17 +63,18 @@ pick_free_gpus() {
         | awk -F, '{gsub(/ /, "", $1); print $1}'
 }
 
-mapfile -t GPUS < <(pick_free_gpus 3)
-if [[ "${#GPUS[@]}" -lt 3 ]]; then
-    echo "ERROR: needed 3 GPUs, only found ${#GPUS[@]}." >&2
+mapfile -t GPUS < <(pick_free_gpus 4)
+if [[ "${#GPUS[@]}" -lt 4 ]]; then
+    echo "ERROR: needed 4 GPUs, only found ${#GPUS[@]}." >&2
     exit 1
 fi
 BC_GPU="${GPUS[0]}"
 DT_GPU="${GPUS[1]}"
 MFQL_GPU="${GPUS[2]}"
+MFBC_GPU="${GPUS[3]}"
 
 # Kill existing sessions so we can start fresh.
-for name in bc_zermelo dt_zermelo mfql_zermelo; do
+for name in bc_zermelo dt_zermelo mfql_zermelo mfbc_zermelo; do
     if tmux has-session -t "$name" 2>/dev/null; then
         echo "Killing existing tmux session '$name'..."
         tmux kill-session -t "$name"
@@ -99,9 +102,9 @@ launch() {
     echo "  $session  ->  GPU $gpu  ->  $log"
 }
 
-echo "Launching 3 training runs (seed=$SEED, conda env=$CONDA_ENV)"
+echo "Launching 4 training runs (seed=$SEED, conda env=$CONDA_ENV)"
 echo "  wandb: project=$PROJ_WANDB (entity=$WANDB_ENTITY)"
-echo "Picked GPUs (least-loaded): $BC_GPU, $DT_GPU, $MFQL_GPU"
+echo "Picked GPUs (least-loaded): $BC_GPU, $DT_GPU, $MFQL_GPU, $MFBC_GPU"
 echo
 
 WANDB_ARGS="--proj_wandb=$PROJ_WANDB"
@@ -112,6 +115,8 @@ launch dt_zermelo   "$DT_GPU"   "$LOG_DIR/dt_${TIMESTAMP}.log" \
     "python scripts/dt_zermelo.py --seed=$SEED --train_steps=$DT_STEPS $WANDB_ARGS"
 launch mfql_zermelo "$MFQL_GPU" "$LOG_DIR/mfql_${TIMESTAMP}.log" \
     "python scripts/meanflowql_zermelo.py --seed=$SEED --offline_steps=$MFQL_STEPS $WANDB_ARGS"
+launch mfbc_zermelo "$MFBC_GPU" "$LOG_DIR/mfbc_${TIMESTAMP}.log" \
+    "python scripts/meanflowbc_zermelo.py --seed=$SEED --offline_steps=$MFBC_STEPS $WANDB_ARGS"
 
 echo
 echo "All sessions launched."
@@ -120,6 +125,7 @@ echo "Reattach to a session:"
 echo "  tmux attach -t bc_zermelo"
 echo "  tmux attach -t dt_zermelo"
 echo "  tmux attach -t mfql_zermelo"
+echo "  tmux attach -t mfbc_zermelo"
 echo
 echo "Detach from a session (leave it running): Ctrl-b then d."
 echo "Tail logs from anywhere:"

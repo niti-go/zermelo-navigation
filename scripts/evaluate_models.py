@@ -62,7 +62,8 @@ START_FRAME_MODE   = 'deterministic_spread'
 #   'best_eval' — read eval.csv and pick by success rate then return;
 #                 falls back to 'last' if no csv.
 #   int         — explicit step number
-CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval'}
+CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval',
+                      'MeanFlowBC': 'best_eval'}
 
 # Whether to plot the offline-dataset return distribution alongside policy
 # returns. The dataset was generated on training flow only; comparing held-out
@@ -140,8 +141,9 @@ RESULTS_ROOT = os.path.join(_REPO_ROOT, 'results')
 # ZERMELO_EVAL_ALGOS env var (comma-separated) restricts which algos are run —
 # used by launch_experiment.sh to skip algos whose training crashed.
 _algos_env = os.environ.get('ZERMELO_EVAL_ALGOS', '')
-ALGO_ORDER  = tuple(_algos_env.split(',')) if _algos_env else ('BC', 'DT', 'MeanFlowQL')
-ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c'}
+ALGO_ORDER  = tuple(_algos_env.split(',')) if _algos_env else ('BC', 'DT', 'MeanFlowQL', 'MeanFlowBC')
+ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c',
+               'MeanFlowBC': '#9467bd'}
 
 
 def _make_segment_labels(cfg):
@@ -221,8 +223,10 @@ class DecisionTransformer(nn.Module):
 # Checkpoint discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ALGO_SUBDIR = {'BC': 'bc', 'DT': 'dt', 'MeanFlowQL': 'meanflowql'}
-_CKPT_GLOB   = {'BC': 'policy_*.pt', 'DT': 'model_*.pt', 'MeanFlowQL': 'params_*.pkl'}
+_ALGO_SUBDIR = {'BC': 'bc', 'DT': 'dt', 'MeanFlowQL': 'meanflowql',
+                'MeanFlowBC': 'meanflow_bc'}
+_CKPT_GLOB   = {'BC': 'policy_*.pt', 'DT': 'model_*.pt',
+                'MeanFlowQL': 'params_*.pkl', 'MeanFlowBC': 'params_*.pkl'}
 
 
 def _step_of(p):
@@ -842,7 +846,10 @@ def plot_trajectories(results, cfg, env, segment, out_path):
     xx, yy = np.meshgrid(xs, ys)
     vx, vy = flow.get_flow_grid(xs, ys, frame=median_frame)
 
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    n_algos = len(ALGO_ORDER)
+    fig, axes = plt.subplots(1, n_algos, figsize=(6 * n_algos, 5.5))
+    if n_algos == 1:
+        axes = [axes]
     for ax, algo in zip(axes, ALGO_ORDER):
         _wall_patches(ax, env)
         ax.quiver(xx, yy, vx, vy, alpha=0.12, color='gray', scale=30)
@@ -991,7 +998,11 @@ def plot_energy_vs_return(results, segment, out_path):
     """Energy (mean ||action||) vs episode return, colored by success.
     Reveals whether returns correlate with effort and whether any algo gets
     away with low-effort high-return episodes."""
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), sharex=True, sharey=True)
+    n_algos = len(ALGO_ORDER)
+    fig, axes = plt.subplots(1, n_algos, figsize=(5 * n_algos, 4.5),
+                             sharex=True, sharey=True)
+    if n_algos == 1:
+        axes = [axes]
     for ax, algo in zip(axes, ALGO_ORDER):
         rets   = np.array([e['return']        for e in results[algo]])
         effort = np.array([e['action_effort'] / max(e['length'], 1)
@@ -1346,6 +1357,10 @@ def main():
         policies['DT'], dt_target = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
     if 'MeanFlowQL' in ALGO_ORDER:
         policies['MeanFlowQL'] = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
+    if 'MeanFlowBC' in ALGO_ORDER:
+        # load_mfql is agent-agnostic: it reads agent_name from flags.json and
+        # builds via the registry, so it loads the critic-free agent too.
+        policies['MeanFlowBC'] = load_mfql(run_dirs['MeanFlowBC'], ckpts['MeanFlowBC'])
 
     # ── Envs ────────────────────────────────────────────────────────────────
     render_env   = make_env(cfg, render_mode='rgb_array') if NUM_VIDEO_EPISODES > 0 else None

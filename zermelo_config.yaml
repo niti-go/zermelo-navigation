@@ -1,8 +1,9 @@
 # Zermelo navigation — single source of truth for env + dataset + training.
 #
 # ── Values for a new experiment ───
-dataset_save_path: datasets/1initialcondition_higherenergycosts.npz
-wandb_project_name: higherenergycosts
+dataset_save_path: datasets/waypointpoorquality_1initialcondition_gridsensors.npz
+#dataset_save_path: datasets/waypointpoorquality_1initialcondition_gridsensors_thinned.npz
+wandb_project_name: waypointpoorquality_1initialcondition_gridsensors
 dataset_type: diverse          # 'straight' | 'diverse'
 
 # --- Arena -----------------------------------------------------------------
@@ -67,7 +68,7 @@ env:
 # Sensors cover the full flow arena (flow.x_range × flow.y_range).
 # Changing this requires regenerating any existing dataset.
 sensors:
-  grid: null
+  grid: [10, 10]
 
 # --- Reward Weights ---------------------------------------------------------------
 # Per-step:
@@ -78,7 +79,7 @@ sensors:
 reward:
   goal_reward: 100.0
   energy:
-    action_weight: 0.3 #was 0.7
+    action_weight: 0.6 #was 0.7
     fixed_hover_cost: 0.0125
   progress_weight: 0.009            # potential-based shaping (Ng et al. 1999)
   drift_threshold: 0.0            # logging-only
@@ -101,8 +102,8 @@ run:
 # generator). The straight-line oracle ignores this block entirely.
 dataset_diverse:
   route:
-    waypoints: [2, 4]             # [min, max] number of random intermediates
-    detour_budget: 4              # max (route / direct-distance) ratio
+    waypoints: [4, 8]             # [min, max] number of random intermediates
+    detour_budget: 6              # max (route / direct-distance) ratio
     waypoint_tolerance: 2.0
     waypoint_step_budget: 0.4     # fraction of max_episode_steps per waypoint
   # Agent personality (per-episode). drift ∈ [0,1] random-walks each
