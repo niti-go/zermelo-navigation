@@ -24,14 +24,14 @@
 # stay recoverable.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
 SEED="${SEED:-0}"
 BC_STEPS="${BC_STEPS:-500000}"
 DT_STEPS="${DT_STEPS:-500000}"
 MFQL_STEPS="${MFQL_STEPS:-1000000}"
 PROJ_WANDB="${PROJ_WANDB:-$(python3 -c "import yaml; print(yaml.safe_load(open('$REPO_ROOT/zermelo_config.yaml'))['wandb_project_name'])")}"
 WANDB_ENTITY="RL_Control_JX"
-
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
 CONDA_ENV="flowrl"
 LOG_DIR="$REPO_ROOT/logs"

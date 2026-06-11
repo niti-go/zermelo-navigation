@@ -16,6 +16,9 @@ sys.path.insert(0, os.path.dirname(_SCRIPT_DIR))
 
 import gymnasium  # noqa: E402
 import imageio  # noqa: E402
+import matplotlib  # noqa: E402
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt  # noqa: E402
 import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 
@@ -71,6 +74,34 @@ def replay_episode(env, qpos_array, actions_array=None, frame_array=None):
     return frames
 
 
+def plot_reward_histogram(data, out_path):
+    """Save histogram of episode returns from the offline dataset."""
+    rewards = data['rewards'].astype(np.float64)
+    terminals = data['terminals'].astype(np.float32)
+    ends = np.where(terminals > 0.5)[0]
+    if len(ends) == 0:
+        print('  No episodes found in dataset; skipping histogram.')
+        return
+    starts = np.concatenate([[0], ends[:-1] + 1])
+    returns = np.array([rewards[s:e + 1].sum() for s, e in zip(starts, ends)])
+
+    lo = float(np.min(returns))
+    hi = max(float(np.max(returns)), lo + 1.0)
+    bins = np.linspace(lo, hi, 51)
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.hist(returns, bins=bins, color='#7f7f7f', alpha=0.85, edgecolor='black', linewidth=0.4)
+    ax.set_xlim(lo, hi)
+    ax.set_xlabel('Episode return')
+    ax.set_ylabel('Episodes')
+    ax.set_title(f'Offline dataset reward distribution (n={len(returns)}, mean={returns.mean():.1f})', loc='left')
+    ax.grid(True, alpha=0.3, axis='y')
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'Saved reward histogram to {out_path}')
+
+
 def main():
     dataset_path = find_latest_dataset()
     print(f'Using dataset: {dataset_path}')
@@ -119,6 +150,11 @@ def main():
 
     imageio.mimsave(OUT_PATH, all_frames, fps=FPS)
     print(f'Saved {len(all_frames)} frames to {OUT_PATH}')
+
+    # Save reward histogram next to video.
+    hist_path = OUT_PATH.replace('.mp4', '_reward_histogram.png')
+    plot_reward_histogram(data, hist_path)
+
     env.close()
 
 
