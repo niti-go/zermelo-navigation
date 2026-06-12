@@ -77,6 +77,7 @@ VIDEO_FPS          = 30
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+import concurrent.futures
 import csv
 import glob
 import json
@@ -1292,6 +1293,62 @@ def _stitch_video(per_algo_frames, out_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Per-algo subprocess worker
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _eval_algo_worker(algo, ckpt_path, run_dir, cfg, tasks, start_frames,
+                      num_video, device_str, dataset_path, segment=''):
+    """Run all episodes for one algorithm.  Intended for subprocess execution.
+
+    Each worker loads its own policy and environments so multiple algos run
+    in parallel without sharing any state.  Returns a list of per-episode dicts;
+    the first `num_video` entries carry a 'frames' key with rendered frames.
+    """
+    device = torch.device(device_str)
+
+    if algo == 'BC':
+        policy = load_bc(run_dir, ckpt_path, device)
+    elif algo == 'DT':
+        policy, _ = load_dt(run_dir, ckpt_path, device, dataset_path)
+    elif algo in ('MeanFlowQL', 'MeanFlowBC'):
+        policy = load_mfql(run_dir, ckpt_path)
+    else:
+        raise ValueError(f'Unknown algo: {algo}')
+
+    render_env   = make_env(cfg, render_mode='rgb_array') if num_video > 0 else None
+    headless_env = make_env(cfg) if num_video < len(tasks) else None
+
+    # Prewarm flow pages for the frames this worker will touch.
+    probe = render_env or headless_env
+    if probe is not None:
+        fps       = float(probe.unwrapped.frames_per_step)
+        max_steps = int(probe.unwrapped._flow_field.n_frames)
+        lo = float(min(start_frames))
+        hi = float(max(start_frames)) + cfg['run']['max_episode_steps'] * fps
+        probe.unwrapped._flow_field.prewarm_range(lo, hi)
+
+    n = len(tasks)
+    eps_list = []
+    for i, (init_ij, goal_ij) in enumerate(tasks):
+        if i % 25 == 0:
+            tag = f'{algo}/{segment}' if segment else algo
+            print(f'  [{tag}] episode {i + 1}/{n}', flush=True)
+        record = i < num_video
+        env = render_env if record else headless_env
+        ep = run_episode(env, policy, float(start_frames[i]), init_ij, goal_ij, record)
+        ep['start_frame'] = float(start_frames[i])
+        ep['init_ij']     = list(init_ij)
+        ep['goal_ij']     = list(goal_ij)
+        if not record:
+            ep.pop('frames', None)
+        eps_list.append(ep)
+
+    if render_env   is not None: render_env.close()
+    if headless_env is not None: headless_env.close()
+    return eps_list
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1347,25 +1404,8 @@ def main():
     if skipped:
         print(f'\n  ⚠ Proceeding with: {", ".join(ALGO_ORDER)}')
 
-    # ── Load policies ───────────────────────────────────────────────────────
-    print('\nLoading policies…')
-    policies = {}
-    dt_target = None
-    if 'BC' in ALGO_ORDER:
-        policies['BC'] = load_bc(run_dirs['BC'], ckpts['BC'], device)
-    if 'DT' in ALGO_ORDER:
-        policies['DT'], dt_target = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
-    if 'MeanFlowQL' in ALGO_ORDER:
-        policies['MeanFlowQL'] = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
-    if 'MeanFlowBC' in ALGO_ORDER:
-        # load_mfql is agent-agnostic: it reads agent_name from flags.json and
-        # builds via the registry, so it loads the critic-free agent too.
-        policies['MeanFlowBC'] = load_mfql(run_dirs['MeanFlowBC'], ckpts['MeanFlowBC'])
-
-    # ── Envs ────────────────────────────────────────────────────────────────
-    render_env   = make_env(cfg, render_mode='rgb_array') if NUM_VIDEO_EPISODES > 0 else None
-    headless_env = make_env(cfg) if NUM_VIDEO_EPISODES < NUM_EVAL_EPISODES else None
-    probe_env = render_env or headless_env
+    # ── Probe env (for metadata only — episodes run in workers) ─────────────
+    probe_env = make_env(cfg)
     n_total = int(probe_env.unwrapped.n_frames)
     n_train = n_train_frames(cfg, probe_env)
     print(f'\nFlow chain: total={n_total} frames, train={n_train} '
@@ -1376,54 +1416,58 @@ def main():
     cells = free_cells(probe_env)
     tasks = sample_episode_tasks(cells, NUM_EVAL_EPISODES, SEED)
 
-    # ── Run each segment ────────────────────────────────────────────────────
-    by_segment = {}
+    # Resolve DT target return for manifest (load_dt does this; reuse dataset).
+    dt_target = None
+    if 'DT' in ALGO_ORDER:
+        dt_target = _dataset_max_return(dataset_path)
+
+    # ── Compute start frames for all segments up-front ──────────────────────
+    segment_start_frames = {}
     segment_wraps = {}
     for segment in EVAL_FLOW_SEGMENTS:
-        print(f'\n══ Evaluating segment: {SEGMENT_LABEL[segment]} ══')
-        start_frames, wraps = episode_start_frames(
-            segment, NUM_EVAL_EPISODES, cfg, probe_env)
+        sf, wraps = episode_start_frames(segment, NUM_EVAL_EPISODES, cfg, probe_env)
+        segment_start_frames[segment] = sf
         segment_wraps[segment] = wraps
-        if wraps:
-            print(f'  ⚠ episodes longer than the segment ({len(start_frames)} '
-                  f'frames headroom) will wrap modulo n_frames.')
 
-        results = {a: [] for a in ALGO_ORDER}
-        policy_time = {a: 0.0 for a in ALGO_ORDER}
+    probe_env.close()
 
-        for i in tqdm(range(NUM_EVAL_EPISODES),
-                      desc=f'  episodes [{segment}]', dynamic_ncols=True):
-            init_ij, goal_ij = tasks[i]
-            sf = float(start_frames[i])
-            record = i < NUM_VIDEO_EPISODES
-            env = render_env if record else headless_env
-
-            algo_eps = {}
+    # ── Run algos in parallel (headless — no EGL in subprocesses) ───────────
+    # Workers use headless envs only. EGL render contexts are created later in
+    # the main process (one at a time) to avoid exhausting GPU display resources.
+    print(f'\nLaunching {len(ALGO_ORDER) * len(EVAL_FLOW_SEGMENTS)} workers '
+          f'({len(ALGO_ORDER)} algos × {len(EVAL_FLOW_SEGMENTS)} segments)…')
+    jobs = {}
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=len(ALGO_ORDER) * len(EVAL_FLOW_SEGMENTS)) as pool:
+        for segment in EVAL_FLOW_SEGMENTS:
+            sf = segment_start_frames[segment]
             for algo in ALGO_ORDER:
-                t_a = time.time()
-                ep = run_episode(env, policies[algo], sf, init_ij, goal_ij, record)
-                policy_time[algo] += time.time() - t_a
-                ep['start_frame'] = sf
-                ep['init_ij']     = list(init_ij)
-                ep['goal_ij']     = list(goal_ij)
-                algo_eps[algo] = ep
-                results[algo].append({k: v for k, v in ep.items() if k != 'frames'})
+                key = (algo, segment)
+                jobs[key] = pool.submit(
+                    _eval_algo_worker,
+                    algo, ckpts[algo], run_dirs[algo], cfg,
+                    tasks, sf,
+                    0,  # num_video=0: no render env in subprocess
+                    DEVICE, dataset_path, segment,
+                )
+        worker_eps = {key: fut.result() for key, fut in jobs.items()}
 
-            if record:
-                stitched = []
-                for algo in ALGO_ORDER:
-                    ep = algo_eps[algo]
-                    lbl = f'{algo} (ret={ep["return"]:.1f})'
-                    stitched.append(
-                        _add_text_overlay(ep['frames'], lbl, ep['success'] > 0.5))
-                _stitch_video(stitched, os.path.join(
-                    videos_dir, f'{segment}_ep{i + 1:02d}.mp4'))
+    # ── Re-create probe_env for plots (cheaply) ──────────────────────────────
+    probe_env = make_env(cfg)
 
+    # ── Collect results, print summaries, make plots ─────────────────────────
+    by_segment = {}
+    for segment in EVAL_FLOW_SEGMENTS:
+        print(f'\n══ Results: {SEGMENT_LABEL[segment]} ══')
+        if segment_wraps[segment]:
+            print('  ⚠ some episodes wrap into adjacent flow segment.')
+
+        results = {algo: list(worker_eps[(algo, segment)])
+                   for algo in ALGO_ORDER}
         by_segment[segment] = results
 
         # Per-segment console summary.
-        print(f'\n  Results ({segment}, n={NUM_EVAL_EPISODES}):')
-        print(f'    {"":>12}  {"success":>8}  {"return":>17}  {"length":>8}  {"time/ep":>8}')
+        print(f'    {"":>12}  {"success":>8}  {"return":>17}  {"length":>8}')
         for algo in ALGO_ORDER:
             eps = results[algo]
             sr  = np.mean([e['success'] for e in eps])
@@ -1432,7 +1476,7 @@ def main():
             length = np.mean([e['length'] for e in eps])
             print(f'    {algo:>12s}  {sr:>7.1%}  '
                   f'{r.mean():>7.1f} [{r_lo:>5.1f},{r_hi:>5.1f}]  '
-                  f'{length:>8.0f}  {policy_time[algo] / NUM_EVAL_EPISODES:>7.2f}s')
+                  f'{length:>8.0f}')
 
         # Per-segment plots.
         plot_trajectories(results, cfg, probe_env, segment,
@@ -1451,6 +1495,35 @@ def main():
                              os.path.join(plots_dir, 'reward_trajectories.png'))
     plot_reward_component_breakdown(
         by_segment, os.path.join(plots_dir, 'reward_components.png'), cfg=cfg)
+
+    # ── Sequential video recording pass (one EGL context at a time) ──────────
+    if NUM_VIDEO_EPISODES > 0:
+        print(f'\nRecording {NUM_VIDEO_EPISODES} video episodes per segment…')
+        device = torch.device(DEVICE)
+        vid_policies = {}
+        if 'BC' in ALGO_ORDER:
+            vid_policies['BC'] = load_bc(run_dirs['BC'], ckpts['BC'], device)
+        if 'DT' in ALGO_ORDER:
+            vid_policies['DT'], _ = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
+        if 'MeanFlowQL' in ALGO_ORDER:
+            vid_policies['MeanFlowQL'] = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
+        if 'MeanFlowBC' in ALGO_ORDER:
+            vid_policies['MeanFlowBC'] = load_mfql(run_dirs['MeanFlowBC'], ckpts['MeanFlowBC'])
+        render_env = make_env(cfg, render_mode='rgb_array')
+        for segment in EVAL_FLOW_SEGMENTS:
+            sf = segment_start_frames[segment]
+            for i in range(NUM_VIDEO_EPISODES):
+                init_ij, goal_ij = tasks[i]
+                stitched = []
+                for algo in ALGO_ORDER:
+                    ep = run_episode(render_env, vid_policies[algo],
+                                     float(sf[i]), init_ij, goal_ij, record_video=True)
+                    lbl = f'{algo} (ret={ep["return"]:.1f})'
+                    stitched.append(_add_text_overlay(ep['frames'], lbl, ep['success'] > 0.5))
+                _stitch_video(stitched, os.path.join(
+                    videos_dir, f'{segment}_ep{i + 1:02d}.mp4'))
+        render_env.close()
+        print(f'  wrote {NUM_VIDEO_EPISODES * len(EVAL_FLOW_SEGMENTS)} video(s)')
 
     # ── Persist metrics + manifest ──────────────────────────────────────────
     metrics_rows = []
@@ -1530,8 +1603,7 @@ def main():
             break
 
     # ── Cleanup + final summary ─────────────────────────────────────────────
-    if render_env is not None:   render_env.close()
-    if headless_env is not None: headless_env.close()
+    probe_env.close()
 
     # Winner line for the primary segment (held-out if present, else train).
     primary = 'heldout' if 'heldout' in by_segment else EVAL_FLOW_SEGMENTS[0]
