@@ -60,19 +60,21 @@ ln -s /path/to/your/HIT/dir/HIT*.nc .
 ls HIT*.nc | wc -l   # should print 49
 ```
 
-## Running an experiment
+## Recommended steps for running an experiment
 
 ```bash
 # (Once) Build the local-SSD flow cache from HIT*.nc.
 conda activate zermelo
 python scripts/build_hit_cache.py
 
-# 1. Edit zermelo_config.yaml — set num_episodes, reward weights, etc.
+# 1. Edit zermelo_config.yaml — 
+#set dataset_save_path, wandb_project_name, etc. 
+#set num_episodes, reward weights, etc.
 
-# 2. Generate the dataset (uses `zermelo` env).
-python scripts/generate_dataset.py --num_workers=16
+# 2. Generate an offline dataset (uses `zermelo` env).
+python scripts/generate_dataset.py
 # or, for a clean straight-line baseline:
-python scripts/generate_straight_dataset.py --num_workers=16
+python scripts/generate_straight_dataset.py
 
 # 3. (Optional) Inspect the reward distribution and get weight suggestions.
 python scripts/helpers/analyze_rewards.py

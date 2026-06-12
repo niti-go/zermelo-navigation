@@ -1,9 +1,14 @@
 # Zermelo navigation — single source of truth for env + dataset + training.
 #
 # ── Values for a new experiment ───
-dataset_save_path: datasets/waypointpoorquality_1initialcondition_gridsensors.npz
-#dataset_save_path: datasets/waypointpoorquality_1initialcondition_gridsensors_thinned.npz
-wandb_project_name: waypointpoorquality_1initialcondition_gridsensors
+# 5x5-sensor (50 readings) overnight sweep. The whole pipeline — generate →
+# thin → train (BC, DT, MeanFlowBC, MFQL alpha sweep) → evaluate — is run by
+# scripts/run_overnight.sh, which generates the RAW dataset into a temp config
+# and leaves this active dataset_save_path pointing at the THINNED set so both
+# training and evaluation read it.
+#dataset_save_path: datasets/waypoint_5x5_gridsensors.npz          # RAW (generation output)
+dataset_save_path: datasets/thinned_5x5.npz                        # THINNED (training + eval)
+wandb_project_name: thinned_5x5_sweep
 dataset_type: diverse          # 'straight' | 'diverse'
 
 # --- Arena -----------------------------------------------------------------
@@ -39,14 +44,14 @@ flow:
   frames_per_step: 5
   target_max: 2.3                 # rescale peak velocity (agent max ≈ 2.83)
   n_tiles: 1.0                    # native-box copies tiling the arena
-  train_max_file: 30
+  train_max_file: 43             # HIT1..HIT43 train, HIT44..HIT49 held out (6 files)
   # How episode start frames are assigned within the train segment:
   #   'deterministic_spread' — one unique frame per episode, sweeping the full range
   #   'random'               — i.i.d. uniform draw each episode
   #   <int> N                — exactly N evenly-spaced frames, cycled: episode i
   #                            uses frame i % N  (e.g. 10 for ten initial conditions)
   # The last flow file is number 49
-  initial_flow_conditions: 1
+  initial_flow_conditions: deterministic_spread
 
 # --- Observation & dynamics ------------------------------------------------
 observation:
@@ -68,7 +73,7 @@ env:
 # Sensors cover the full flow arena (flow.x_range × flow.y_range).
 # Changing this requires regenerating any existing dataset.
 sensors:
-  grid: [10, 10]
+  grid: [5, 5]
 
 # --- Reward Weights ---------------------------------------------------------------
 # Per-step:

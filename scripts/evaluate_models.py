@@ -41,6 +41,8 @@ SEED               = 42
 CUDA_VISIBLE_DEVICES = None
 
 # How many episodes to evaluate per segment, and how many of those to record as videos.
+# NUM_EVAL_EPISODES can be overridden by the ZERMELO_EVAL_EPISODES env var
+# (applied just below the imports, once os is available).
 NUM_EVAL_EPISODES  = 200
 NUM_VIDEO_EPISODES = 3
 
@@ -57,13 +59,11 @@ EVAL_FLOW_SEGMENTS = ('heldout', 'train')
 #   'random'               — uniform random (seeded)
 START_FRAME_MODE   = 'deterministic_spread'
 
-# Per-algo checkpoint selection.
+# Per-category checkpoint selection (see _CATEGORY_CKPT_POLICY below).
 #   'last'      — highest step number
 #   'best_eval' — read eval.csv and pick by success rate then return;
 #                 falls back to 'last' if no csv.
 #   int         — explicit step number
-CHECKPOINT_POLICY  = {'BC': 'last', 'DT': 'last', 'MeanFlowQL': 'best_eval',
-                      'MeanFlowBC': 'best_eval'}
 
 # Whether to plot the offline-dataset return distribution alongside policy
 # returns. The dataset was generated on training flow only; comparing held-out
@@ -138,13 +138,127 @@ from zermelo_env.hit_chain import HITChainFlow
 
 RESULTS_ROOT = os.path.join(_REPO_ROOT, 'results')
 
-# Visual constants (changing these only affects plots, not eval).
-# ZERMELO_EVAL_ALGOS env var (comma-separated) restricts which algos are run —
-# used by launch_experiment.sh to skip algos whose training crashed.
-_algos_env = os.environ.get('ZERMELO_EVAL_ALGOS', '')
-ALGO_ORDER  = tuple(_algos_env.split(',')) if _algos_env else ('BC', 'DT', 'MeanFlowQL', 'MeanFlowBC')
-ALGO_COLORS = {'BC': '#1f77b4', 'DT': '#ff7f0e', 'MeanFlowQL': '#2ca02c',
-               'MeanFlowBC': '#9467bd'}
+# Episode-count override (env wins over the constant above).
+NUM_EVAL_EPISODES = int(os.environ.get('ZERMELO_EVAL_EPISODES', NUM_EVAL_EPISODES))
+
+# ── Entry model ──────────────────────────────────────────────────────────────
+# This script evaluates one "entry" per run-group directory under
+# exp/<project>/, so MFQL sweep variants (mfql_alpha1, mfql_alpha3, …) each show
+# up as their own line in every plot. An entry has a display name (== run-group
+# dir, also the key into the per-segment results dict), a loader category
+# (BC / DT / MF — MF covers MeanFlowQL and MeanFlowBC, which share a loader), and
+# a color.
+#
+# Entries are auto-discovered from disk by default (discover_entries), so
+# whatever trained successfully is shown. ZERMELO_EVAL_ALGOS (comma-separated)
+# restricts/overrides: each token is either a base-algo name
+# (BC/DT/MeanFlowQL/MeanFlowBC → its default run-group dir) or a literal
+# run-group dir name. launch_experiment.sh still uses the base-algo form.
+
+# category → checkpoint glob + selection policy.
+_CATEGORY_GLOB        = {'BC': 'policy_*.pt', 'DT': 'model_*.pt', 'MF': 'params_*.pkl'}
+_CATEGORY_CKPT_POLICY = {'BC': 'last',        'DT': 'last',       'MF': 'best_eval'}
+
+# Legacy base-algo name → (default run-group dir, category).
+_BASE_ALGO = {
+    'BC':         ('bc',          'BC'),
+    'DT':         ('dt',          'DT'),
+    'MeanFlowQL': ('meanflowql',  'MF'),
+    'MeanFlowBC': ('meanflow_bc', 'MF'),
+}
+
+# Per-entry color palette (red #d62728 is reserved for failures in plots).
+_ENTRY_PALETTE = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b',
+                  '#17becf', '#bcbd22', '#e377c2', '#1a9850', '#762a83',
+                  '#636363', '#fdae61']
+
+# Populated in main() by resolve_entries() once EXP_PROJECT is known.
+ALGO_ORDER      = ()    # tuple of entry names (display labels + result keys)
+ALGO_COLORS     = {}    # entry name → color
+_ENTRY_SUBDIR   = {}    # entry name → run-group dir under exp/<project>
+_ENTRY_CATEGORY = {}    # entry name → 'BC' | 'DT' | 'MF'
+
+
+def _latest_run_subdir(group_dir):
+    subs = [os.path.join(group_dir, d) for d in os.listdir(group_dir)
+            if os.path.isdir(os.path.join(group_dir, d))]
+    return sorted(subs)[-1] if subs else None
+
+
+def _detect_category(run_dir):
+    """Infer loader category from which checkpoint files a run dir contains."""
+    if run_dir is None:
+        return None
+    for cat, pat in _CATEGORY_GLOB.items():
+        if glob.glob(os.path.join(run_dir, pat)):
+            return cat
+    return None
+
+
+def _category_sort_key(cat):
+    return {'BC': 0, 'DT': 1, 'MF': 2}.get(cat, 3)
+
+
+def discover_entries(exp_project):
+    """Scan exp/<project>/ for run-group dirs that contain checkpoints.
+
+    Returns [(name, subdir, category)] sorted BC, DT, then MF variants. A
+    run-group with no usable checkpoints (e.g. a crashed training) is skipped,
+    which is what makes the overnight eval robust to partial failures.
+    """
+    base = os.path.join(_REPO_ROOT, 'exp', exp_project)
+    if not os.path.isdir(base):
+        return []
+    found = []
+    for name in sorted(os.listdir(base)):
+        group_dir = os.path.join(base, name)
+        if not os.path.isdir(group_dir):
+            continue
+        cat = _detect_category(_latest_run_subdir(group_dir))
+        if cat is not None:
+            found.append((name, name, cat))
+    found.sort(key=lambda e: (_category_sort_key(e[2]), e[0]))
+    return found
+
+
+def entries_from_env(spec, exp_project):
+    """Build entries from a ZERMELO_EVAL_ALGOS override string."""
+    out = []
+    for tok in (t.strip() for t in spec.split(',')):
+        if not tok:
+            continue
+        if tok in _BASE_ALGO:
+            subdir, cat = _BASE_ALGO[tok]
+            out.append((tok, subdir, cat))
+            continue
+        cat = _detect_category(_latest_run_subdir(
+            os.path.join(_REPO_ROOT, 'exp', exp_project, tok)))
+        if cat is None:
+            print(f'  [entries] skipping {tok!r}: no checkpoints found')
+            continue
+        out.append((tok, tok, cat))
+    out.sort(key=lambda e: (_category_sort_key(e[2]), e[0]))
+    return out
+
+
+def resolve_entries(exp_project):
+    """Populate the ALGO_ORDER / ALGO_COLORS / _ENTRY_* globals."""
+    global ALGO_ORDER, ALGO_COLORS, _ENTRY_SUBDIR, _ENTRY_CATEGORY
+    spec = os.environ.get('ZERMELO_EVAL_ALGOS', '').strip()
+    entries = entries_from_env(spec, exp_project) if spec else discover_entries(exp_project)
+    if not entries:
+        raise RuntimeError(
+            f'No evaluatable run groups under exp/{exp_project}/. '
+            f'Train some models first (or set ZERMELO_EVAL_ALGOS).')
+    ALGO_ORDER      = tuple(name for name, _, _ in entries)
+    _ENTRY_SUBDIR   = {name: subdir for name, subdir, _ in entries}
+    _ENTRY_CATEGORY = {name: cat for name, _, cat in entries}
+    ALGO_COLORS     = {name: _ENTRY_PALETTE[i % len(_ENTRY_PALETTE)]
+                       for i, name in enumerate(ALGO_ORDER)}
+    print(f'Entries to evaluate ({len(ALGO_ORDER)}):')
+    for name in ALGO_ORDER:
+        print(f'  {name:16s} category={_ENTRY_CATEGORY[name]:3s} '
+              f'dir=exp/{exp_project}/{_ENTRY_SUBDIR[name]}')
 
 
 def _make_segment_labels(cfg):
@@ -224,18 +338,12 @@ class DecisionTransformer(nn.Module):
 # Checkpoint discovery
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ALGO_SUBDIR = {'BC': 'bc', 'DT': 'dt', 'MeanFlowQL': 'meanflowql',
-                'MeanFlowBC': 'meanflow_bc'}
-_CKPT_GLOB   = {'BC': 'policy_*.pt', 'DT': 'model_*.pt',
-                'MeanFlowQL': 'params_*.pkl', 'MeanFlowBC': 'params_*.pkl'}
-
-
 def _step_of(p):
     return int(os.path.basename(p).rsplit('_', 1)[1].split('.')[0])
 
 
 def find_run_dir(algo):
-    base = os.path.join(_REPO_ROOT, 'exp', EXP_PROJECT, _ALGO_SUBDIR[algo])
+    base = os.path.join(_REPO_ROOT, 'exp', EXP_PROJECT, _ENTRY_SUBDIR[algo])
     if RUN_TAG is not None:
         cand = os.path.join(base, RUN_TAG)
         if not os.path.isdir(cand):
@@ -252,9 +360,10 @@ def find_run_dir(algo):
 
 
 def select_checkpoint(run_dir, algo, policy):
-    all_files = sorted(glob.glob(os.path.join(run_dir, _CKPT_GLOB[algo])))
+    glob_pat = _CATEGORY_GLOB[_ENTRY_CATEGORY[algo]]
+    all_files = sorted(glob.glob(os.path.join(run_dir, glob_pat)))
     if not all_files:
-        raise FileNotFoundError(f'No {_CKPT_GLOB[algo]} in {run_dir}')
+        raise FileNotFoundError(f'No {glob_pat} in {run_dir}')
 
     # Drop empty/corrupted files so we never load a 0-byte checkpoint.
     files = [f for f in all_files if os.path.getsize(f) > 0]
@@ -305,7 +414,7 @@ def select_checkpoint(run_dir, algo, policy):
               f'nearest saved step {_step_of(nearest)}')
         return nearest
 
-    raise ValueError(f'Unknown CHECKPOINT_POLICY for {algo}: {policy!r}')
+    raise ValueError(f'Unknown checkpoint policy for {algo}: {policy!r}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -966,6 +1075,62 @@ def plot_return_histogram(results, cfg, segment, out_path):
     plt.close(fig)
 
 
+def plot_energy_histogram(results, cfg, segment, out_path):
+    """Per-algo histogram of total action energy spent per episode, plus the
+    offline dataset. Energy is the action-weight cost the env charges,
+    w_action * sum_t ||a_t||, so lower = more drifting (smaller actions).
+    Each title also reports mean ||a|| per step, the length-independent drift
+    indicator."""
+    ds = _dataset_episode_metrics(cfg) if COMPARE_TO_OFFLINE_DATASET else None
+    w_action = float(cfg['reward']['energy']['action_weight'])
+
+    def algo_energy(algo):
+        return [w_action * e['action_effort'] for e in results[algo]]
+
+    def algo_mean_mag(algo):
+        return [e['action_effort'] / max(e['length'], 1) for e in results[algo]]
+
+    all_e = [v for a in ALGO_ORDER for v in algo_energy(a)]
+    if ds is not None:
+        all_e = all_e + (w_action * ds['mean_action_mag'] * ds['length']).tolist()
+    if not all_e:
+        return
+    lo = float(np.min(all_e))
+    hi = max(float(np.max(all_e)), lo + 1.0)
+    bins = np.linspace(lo, hi, 51)
+
+    panels = []
+    for algo in ALGO_ORDER:
+        es = algo_energy(algo)
+        mm = algo_mean_mag(algo)
+        panels.append((es, ALGO_COLORS[algo],
+                       f'{algo}  (mean energy={np.mean(es):.1f}, '
+                       f'mean ||a||/step={np.mean(mm):.3f}, n={len(es)})'))
+    if ds is not None:
+        ds_energy = (w_action * ds['mean_action_mag'] * ds['length']).tolist()
+        panels.append((ds_energy, '#7f7f7f',
+                       f'Offline dataset  (mean energy={np.mean(ds_energy):.1f}, '
+                       f'mean ||a||/step={ds["mean_action_mag"].mean():.3f}, '
+                       f'n={len(ds_energy)})'))
+
+    fig, axes = plt.subplots(len(panels), 1,
+                             figsize=(8, 2.2 * len(panels)), sharex=True)
+    if len(panels) == 1:
+        axes = [axes]
+    for ax, (es, color, title) in zip(axes, panels):
+        ax.hist(es, bins=bins, color=color, alpha=0.85,
+                edgecolor='black', linewidth=0.4)
+        ax.set_xlim(lo, hi)
+        ax.set_ylabel('Episodes')
+        ax.set_title(title, loc='left', fontsize=11)
+        ax.grid(True, alpha=0.3, axis='y')
+    axes[-1].set_xlabel('Total action energy per episode  (w_action * sum ||a||)')
+    fig.suptitle(f'Action-energy distribution — {SEGMENT_LABEL[segment]}', fontsize=13)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+
+
 def plot_success_vs_init_dist(results, segment, out_path):
     """Per-algo: rolling success rate as a function of initial distance to goal.
     Tells you whether each algo's wins are easy short tasks vs. genuinely
@@ -1296,24 +1461,25 @@ def _stitch_video(per_algo_frames, out_path):
 # Per-algo subprocess worker
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _eval_algo_worker(algo, ckpt_path, run_dir, cfg, tasks, start_frames,
-                      num_video, device_str, dataset_path, segment=''):
-    """Run all episodes for one algorithm.  Intended for subprocess execution.
+def _eval_algo_worker(algo, category, ckpt_path, run_dir, cfg, tasks,
+                      start_frames, num_video, device_str, dataset_path,
+                      segment=''):
+    """Run all episodes for one entry.  Intended for subprocess execution.
 
-    Each worker loads its own policy and environments so multiple algos run
+    Each worker loads its own policy and environments so multiple entries run
     in parallel without sharing any state.  Returns a list of per-episode dicts;
     the first `num_video` entries carry a 'frames' key with rendered frames.
     """
     device = torch.device(device_str)
 
-    if algo == 'BC':
+    if category == 'BC':
         policy = load_bc(run_dir, ckpt_path, device)
-    elif algo == 'DT':
+    elif category == 'DT':
         policy, _ = load_dt(run_dir, ckpt_path, device, dataset_path)
-    elif algo in ('MeanFlowQL', 'MeanFlowBC'):
+    elif category == 'MF':
         policy = load_mfql(run_dir, ckpt_path)
     else:
-        raise ValueError(f'Unknown algo: {algo}')
+        raise ValueError(f'Unknown category for {algo}: {category!r}')
 
     render_env   = make_env(cfg, render_mode='rgb_array') if num_video > 0 else None
     headless_env = make_env(cfg) if num_video < len(tasks) else None
@@ -1372,6 +1538,7 @@ def main():
     cfg = load_config(None)
     EXP_PROJECT = cfg['wandb_project_name']
     SEGMENT_LABEL = _make_segment_labels(cfg)
+    resolve_entries(EXP_PROJECT)
     device = torch.device(DEVICE)
     dataset_path = os.path.join(_REPO_ROOT, cfg['dataset_save_path'])
 
@@ -1392,7 +1559,8 @@ def main():
     for a in ALGO_ORDER:
         try:
             run_dirs[a] = find_run_dir(a)
-            ckpts[a] = select_checkpoint(run_dirs[a], a, CHECKPOINT_POLICY[a])
+            ckpts[a] = select_checkpoint(
+                run_dirs[a], a, _CATEGORY_CKPT_POLICY[_ENTRY_CATEGORY[a]])
             print(f'  {a:12s}  run_dir={os.path.relpath(run_dirs[a], _REPO_ROOT)}')
             print(f'  {"":12s}  ckpt   ={os.path.relpath(ckpts[a],    _REPO_ROOT)}')
         except FileNotFoundError as e:
@@ -1418,7 +1586,7 @@ def main():
 
     # Resolve DT target return for manifest (load_dt does this; reuse dataset).
     dt_target = None
-    if 'DT' in ALGO_ORDER:
+    if any(_ENTRY_CATEGORY[a] == 'DT' for a in ALGO_ORDER):
         dt_target = _dataset_max_return(dataset_path)
 
     # ── Compute start frames for all segments up-front ──────────────────────
@@ -1445,7 +1613,7 @@ def main():
                 key = (algo, segment)
                 jobs[key] = pool.submit(
                     _eval_algo_worker,
-                    algo, ckpts[algo], run_dirs[algo], cfg,
+                    algo, _ENTRY_CATEGORY[algo], ckpts[algo], run_dirs[algo], cfg,
                     tasks, sf,
                     0,  # num_video=0: no render env in subprocess
                     DEVICE, dataset_path, segment,
@@ -1485,6 +1653,8 @@ def main():
                         os.path.join(plots_dir, f'comparison_{segment}.png'))
         plot_return_histogram(results, cfg, segment,
                               os.path.join(plots_dir, f'return_histogram_{segment}.png'))
+        plot_energy_histogram(results, cfg, segment,
+                              os.path.join(plots_dir, f'energy_histogram_{segment}.png'))
 
     # ── Cross-segment plot ──────────────────────────────────────────────────
     if 'train' in by_segment and 'heldout' in by_segment:
@@ -1501,14 +1671,14 @@ def main():
         print(f'\nRecording {NUM_VIDEO_EPISODES} video episodes per segment…')
         device = torch.device(DEVICE)
         vid_policies = {}
-        if 'BC' in ALGO_ORDER:
-            vid_policies['BC'] = load_bc(run_dirs['BC'], ckpts['BC'], device)
-        if 'DT' in ALGO_ORDER:
-            vid_policies['DT'], _ = load_dt(run_dirs['DT'], ckpts['DT'], device, dataset_path)
-        if 'MeanFlowQL' in ALGO_ORDER:
-            vid_policies['MeanFlowQL'] = load_mfql(run_dirs['MeanFlowQL'], ckpts['MeanFlowQL'])
-        if 'MeanFlowBC' in ALGO_ORDER:
-            vid_policies['MeanFlowBC'] = load_mfql(run_dirs['MeanFlowBC'], ckpts['MeanFlowBC'])
+        for algo in ALGO_ORDER:
+            cat = _ENTRY_CATEGORY[algo]
+            if cat == 'BC':
+                vid_policies[algo] = load_bc(run_dirs[algo], ckpts[algo], device)
+            elif cat == 'DT':
+                vid_policies[algo], _ = load_dt(run_dirs[algo], ckpts[algo], device, dataset_path)
+            elif cat == 'MF':
+                vid_policies[algo] = load_mfql(run_dirs[algo], ckpts[algo])
         render_env = make_env(cfg, render_mode='rgb_array')
         for segment in EVAL_FLOW_SEGMENTS:
             sf = segment_start_frames[segment]
@@ -1577,7 +1747,9 @@ def main():
         'eval_flow_segments':  list(EVAL_FLOW_SEGMENTS),
         'heldout_start_frame_mode':       START_FRAME_MODE,
         'train_initial_flow_conditions':  cfg['flow'].get('initial_flow_conditions'),
-        'checkpoint_policy':   CHECKPOINT_POLICY,
+        'checkpoint_policy':   {a: _CATEGORY_CKPT_POLICY[_ENTRY_CATEGORY[a]]
+                                for a in ALGO_ORDER},
+        'entry_categories':    {a: _ENTRY_CATEGORY[a] for a in ALGO_ORDER},
         'compare_to_offline_dataset': COMPARE_TO_OFFLINE_DATASET,
         'device':              DEVICE,
         'dataset_path':        os.path.relpath(dataset_path, _REPO_ROOT),

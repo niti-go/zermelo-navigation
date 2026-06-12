@@ -13,6 +13,7 @@
 #   BC_STEPS    — BC train_steps                        (default 500000)
 #   DT_STEPS    — DT train_steps                        (default 500000)
 #   MFQL_STEPS  — MeanFlowQL offline_steps              (default 1000000)
+#   MFBC_STEPS  — MeanFlowBC (critic-free) offline_steps (default 1000000)
 #
 # Config keys read from zermelo_config.yaml:
 #   wandb_project_name — names the tmux session and wandb project
@@ -24,6 +25,7 @@ SEED="${SEED:-0}"
 BC_STEPS="${BC_STEPS:-500000}"
 DT_STEPS="${DT_STEPS:-500000}"
 MFQL_STEPS="${MFQL_STEPS:-1000000}"
+MFBC_STEPS="${MFBC_STEPS:-1000000}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
@@ -77,6 +79,7 @@ SEED="$SEED"
 BC_STEPS="$BC_STEPS"
 DT_STEPS="$DT_STEPS"
 MFQL_STEPS="$MFQL_STEPS"
+MFBC_STEPS="$MFBC_STEPS"
 DATASET_ENV="$DATASET_ENV"
 TRAIN_ENV="$TRAIN_ENV"
 
@@ -102,24 +105,26 @@ echo "[\$(date +%T)] Dataset complete."
 echo
 
 # ── 2/3  Launch 3 trainings in parallel ──────────────────────────────────────
-echo "[\$(date +%T)] 2/3  Launching BC, DT, MeanFlowQL in parallel..."
+echo "[\$(date +%T)] 2/3  Launching BC, DT, MeanFlowQL, MeanFlowBC in parallel..."
 conda activate "\$TRAIN_ENV"
 
-# Pick the 3 least-loaded GPUs right now (dataset gen is done, GPUs are free).
+# Pick the 4 least-loaded GPUs right now (dataset gen is done, GPUs are free).
 mapfile -t GPUS < <(nvidia-smi --query-gpu=index,memory.used \
     --format=csv,noheader,nounits \
-    | sort -t, -k2 -n | head -n 3 \
+    | sort -t, -k2 -n | head -n 4 \
     | awk -F, '{gsub(/ /, "", \$1); print \$1}')
-if [[ "\${#GPUS[@]}" -lt 3 ]]; then
-    echo "ERROR: need 3 GPUs for training, found \${#GPUS[@]}" >&2; exit 1
+if [[ "\${#GPUS[@]}" -lt 4 ]]; then
+    echo "ERROR: need 4 GPUs for training, found \${#GPUS[@]}" >&2; exit 1
 fi
 BC_GPU="\${GPUS[0]}"
 DT_GPU="\${GPUS[1]}"
 MFQL_GPU="\${GPUS[2]}"
+MFBC_GPU="\${GPUS[3]}"
 
 BC_LOG="\$LOG_DIR/bc_\$TIMESTAMP.log"
 DT_LOG="\$LOG_DIR/dt_\$TIMESTAMP.log"
 MFQL_LOG="\$LOG_DIR/mfql_\$TIMESTAMP.log"
+MFBC_LOG="\$LOG_DIR/mfbc_\$TIMESTAMP.log"
 
 CUDA_VISIBLE_DEVICES=\$BC_GPU python scripts/bc_zermelo.py \
     --seed=\$SEED --train_steps=\$BC_STEPS \
@@ -136,9 +141,15 @@ CUDA_VISIBLE_DEVICES=\$MFQL_GPU python scripts/meanflowql_zermelo.py \
     > "\$MFQL_LOG" 2>&1 &
 MFQL_PID=\$!
 
+CUDA_VISIBLE_DEVICES=\$MFBC_GPU python scripts/meanflowbc_zermelo.py \
+    --seed=\$SEED --offline_steps=\$MFBC_STEPS \
+    > "\$MFBC_LOG" 2>&1 &
+MFBC_PID=\$!
+
 echo "  BC         → GPU \$BC_GPU    (PID \$BC_PID)    → \$(basename \$BC_LOG)"
 echo "  DT         → GPU \$DT_GPU    (PID \$DT_PID)    → \$(basename \$DT_LOG)"
 echo "  MeanFlowQL → GPU \$MFQL_GPU  (PID \$MFQL_PID)  → \$(basename \$MFQL_LOG)"
+echo "  MeanFlowBC → GPU \$MFBC_GPU  (PID \$MFBC_PID)  → \$(basename \$MFBC_LOG)"
 echo
 echo "  Tail a log:  tail -f \$MFQL_LOG"
 echo "  Waiting for all 3 to finish..."
@@ -150,6 +161,7 @@ set +e
 wait \$BC_PID;   BC_EXIT=\$?
 wait \$DT_PID;   DT_EXIT=\$?
 wait \$MFQL_PID; MFQL_EXIT=\$?
+wait \$MFBC_PID; MFBC_EXIT=\$?
 set -e
 
 SUCCEEDED=""
@@ -167,6 +179,7 @@ _check() {
 _check BC         \$BC_EXIT
 _check DT         \$DT_EXIT
 _check MeanFlowQL \$MFQL_EXIT
+_check MeanFlowBC \$MFBC_EXIT
 echo
 
 if [ -z "\$SUCCEEDED" ]; then

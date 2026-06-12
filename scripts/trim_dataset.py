@@ -45,22 +45,26 @@ in the source fall in each density region.  The resulting distribution
 shape will match the target.
 """
 
+import os
 import numpy as np
 import pathlib
 
 # ---------------------------------------------------------------------------
 # ~~~ EDIT THESE ~~~
+# Paths and seed can also be overridden by environment variables
+# (TRIM_INPUT, TRIM_OUTPUT, TRIM_SEED), which is how run_overnight.sh drives
+# this script without editing the file.
 # ---------------------------------------------------------------------------
 
-INPUT_PATH  = 'datasets/waypointpoorquality_1initialcondition_gridsensors.npz'
-OUTPUT_PATH = 'datasets/newest_thinned.npz'
+INPUT_PATH  = os.environ.get('TRIM_INPUT',  'datasets/waypoint_5x5_gridsensors.npz')
+OUTPUT_PATH = os.environ.get('TRIM_OUTPUT', 'datasets/thinned_5x5.npz')
 
 # Piecewise-linear target distribution.
 # Duplicate return values = near-vertical cliff.
 TARGET_RETURNS   = [-600, -300, -250,  -100,  50,    0]
 TARGET_DENSITIES = [ 0.0,  0.0,  1.0,  1.0,  0.5,  0.5]
 
-SEED = 42
+SEED = int(os.environ.get('TRIM_SEED', '42'))
 
 # ---------------------------------------------------------------------------
 # Internals — no need to edit below this line
