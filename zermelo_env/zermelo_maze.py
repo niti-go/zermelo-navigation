@@ -622,11 +622,14 @@ def make_zermelo_maze_env(*args, **kwargs):
                 base_ob = super().get_ob()  # [x, y, flow_vx, flow_vy]
                 ob = np.concatenate([base_ob, self.cur_goal_xy])
                 if self._sensor_positions is not None:
-                    readings = np.array(
-                        [v for sx, sy in self._sensor_positions
-                         for v in self._flow_field.get_flow(sx, sy, self._frame)],
-                        dtype=np.float64,
+                    vx_arr, vy_arr = self._flow_field.get_flow_batch(
+                        self._sensor_positions[:, 0],
+                        self._sensor_positions[:, 1],
+                        self._frame,
                     )
+                    readings = np.empty(len(vx_arr) * 2, dtype=np.float64)
+                    readings[0::2] = vx_arr
+                    readings[1::2] = vy_arr
                     ob = np.concatenate([ob, readings])
                 return ob
             else:

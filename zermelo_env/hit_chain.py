@@ -83,6 +83,12 @@ class HITChainFlow:
     def __init__(self, nc_dir, max_file=None, x_range=(-4.0, 24.0),
                  y_range=(-4.0, 24.0), n_tiles=1.0, target_max=None,
                  cache_dir=None):
+        # LRU cache for recently accessed frame slices (indexed by integer frame
+        # index).  A typical env step calls _get_slice with the same i0 and i1
+        # for every one of the 100+ sensor positions, so the second and later
+        # calls for the same frame index are pure dictionary lookups.
+        self._slice_cache: dict = {}   # frame_idx -> (u_view, v_view)
+        self._slice_cache_keys: list = []  # insertion order for eviction
         nc_paths = _list_hit_files(nc_dir, max_file=max_file)
         self._nc_paths = nc_paths
 
@@ -178,12 +184,45 @@ class HITChainFlow:
         self.prewarm_range(0, self.n_frames, verbose=verbose)
 
     def _get_slice(self, frame_idx):
-        """Return (u, v) snapshot views for an integer frame index."""
+        """Return (u, v) snapshot views for an integer frame index.
+
+        Results are cached (up to 4 entries).  Within a single env step every
+        sensor position is queried at the same two frame indices (i0, i1), so
+        the second and later lookups for a given index are free dictionary hits.
+        """
         idx = int(frame_idx) % self.n_frames
+        cached = self._slice_cache.get(idx)
+        if cached is not None:
+            return cached
         file_i = int(np.searchsorted(self._file_offsets, idx, side='right') - 1)
         local_idx = idx - int(self._file_offsets[file_i])
         slab = self._memmaps[file_i][local_idx]  # (nx, ny, 2) view
-        return slab[..., 0], slab[..., 1]
+        uv = (slab[..., 0], slab[..., 1])
+        self._slice_cache[idx] = uv
+        self._slice_cache_keys.append(idx)
+        if len(self._slice_cache_keys) > 4:
+            self._slice_cache.pop(self._slice_cache_keys.pop(0), None)
+        return uv
+
+    def _interp_scalar(self, u_frame, v_frame, nx_pt, ny_pt):
+        """Bilinear interpolation at a single (nx_pt, ny_pt) without numpy overhead."""
+        ix = (nx_pt - self._x_native_min) / self._dx_native
+        iy = (ny_pt - self._y_native_min) / self._dy_native
+        i0 = int(ix) % self._nx
+        j0 = int(iy) % self._ny
+        i1 = (i0 + 1) % self._nx
+        j1 = (j0 + 1) % self._ny
+        fx = ix % 1.0
+        fy = iy % 1.0
+        w00 = (1 - fx) * (1 - fy)
+        w10 = fx * (1 - fy)
+        w01 = (1 - fx) * fy
+        w11 = fx * fy
+        u = (w00 * float(u_frame[i0, j0]) + w10 * float(u_frame[i1, j0])
+             + w01 * float(u_frame[i0, j1]) + w11 * float(u_frame[i1, j1]))
+        v = (w00 * float(v_frame[i0, j0]) + w10 * float(v_frame[i1, j0])
+             + w01 * float(v_frame[i0, j1]) + w11 * float(v_frame[i1, j1]))
+        return u, v
 
     def _arena_to_native_xy(self, x, y):
         fx = (np.asarray(x) - self.x_range[0]) / self._Lx_arena * self._n_tiles
@@ -218,23 +257,46 @@ class HITChainFlow:
 
         `frame` may be fractional; values are linearly interpolated between
         adjacent snapshots. Out-of-range frames wrap modulo n_frames.
+        Uses scalar arithmetic and cached frame slices to avoid numpy overhead
+        on the hot per-step path.
         """
         nx_pt, ny_pt = self._arena_to_native_xy(x, y)
+        nx_s, ny_s = float(nx_pt), float(ny_pt)
         f = float(frame) % self.n_frames
-        i0 = int(np.floor(f))
+        i0 = int(f)
         alpha = f - i0
         i1 = (i0 + 1) % self.n_frames
-
         u0, v0 = self._get_slice(i0)
-        u_a, v_a = self._interp_frame(u0, v0, np.atleast_1d(nx_pt), np.atleast_1d(ny_pt))
+        vx_a, vy_a = self._interp_scalar(u0, v0, nx_s, ny_s)
         if alpha > 1e-9:
             u1, v1 = self._get_slice(i1)
-            u_b, v_b = self._interp_frame(u1, v1, np.atleast_1d(nx_pt), np.atleast_1d(ny_pt))
-            vx_n = (1 - alpha) * u_a + alpha * u_b
-            vy_n = (1 - alpha) * v_a + alpha * v_b
-        else:
-            vx_n, vy_n = u_a, v_a
-        return float(vx_n.ravel()[0]) * self._vel_scale, float(vy_n.ravel()[0]) * self._vel_scale
+            vx_b, vy_b = self._interp_scalar(u1, v1, nx_s, ny_s)
+            return (((1 - alpha) * vx_a + alpha * vx_b) * self._vel_scale,
+                    ((1 - alpha) * vy_a + alpha * vy_b) * self._vel_scale)
+        return vx_a * self._vel_scale, vy_a * self._vel_scale
+
+    def get_flow_batch(self, xs, ys, frame=0.0):
+        """Return (vx_arr, vy_arr) for N paired (xs[i], ys[i]) positions.
+
+        Single frame-slice lookup + vectorised bilinear interpolation for all N
+        points.  Dramatically faster than calling get_flow() in a Python loop
+        when N is large (e.g. a 10×10 sensor grid = 100 points per env step).
+        """
+        xs = np.asarray(xs, dtype=np.float64)
+        ys = np.asarray(ys, dtype=np.float64)
+        nx_pts, ny_pts = self._arena_to_native_xy(xs, ys)
+        f = float(frame) % self.n_frames
+        i0 = int(f)
+        alpha = f - i0
+        i1 = (i0 + 1) % self.n_frames
+        u0, v0 = self._get_slice(i0)
+        vx_a, vy_a = self._interp_frame(u0, v0, nx_pts, ny_pts)
+        if alpha > 1e-9:
+            u1, v1 = self._get_slice(i1)
+            vx_b, vy_b = self._interp_frame(u1, v1, nx_pts, ny_pts)
+            return (((1 - alpha) * vx_a + alpha * vx_b) * self._vel_scale,
+                    ((1 - alpha) * vy_a + alpha * vy_b) * self._vel_scale)
+        return vx_a * self._vel_scale, vy_a * self._vel_scale
 
     def get_flow_grid(self, xs, ys, frame=0.0):
         """Return (vx, vy) on the meshgrid of (xs, ys) at frame `frame`."""
